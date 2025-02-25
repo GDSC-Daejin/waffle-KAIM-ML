@@ -8,31 +8,33 @@ from train import train_model
 from predict import predict_future
 
 def export_predictions():
+    """
+    MongoDB에서 데이터를 불러와 미래 예측 결과를 CSV로 내보냅니다.
+    """
+    # 1) MongoDB에서 데이터 불러오기
     df = load_data_from_mongo()
-    # 'date' 컬럼에서 "Date_" 접두사를 제거하고, "%Y_%m_%d" 형식으로 파싱
+
+    # 2) 날짜 처리 ("Date_" 접두사 제거 + "%Y_%m_%d" 형태)
     df['date'] = pd.to_datetime(df['date'].str.replace("Date_", "", regex=False), format="%Y_%m_%d")
     df.sort_values('date', inplace=True)
     
+    # 3) date 컬럼 제외한 나머지
     features = df.drop(columns=['date'])
+    # 숫자로 변환 (변환 안 되면 NaN), 전부 NaN이면 컬럼 제거
     features = features.apply(pd.to_numeric, errors='coerce')
     features = features.dropna(axis=1, how='all')
     
-    # 영어 컬럼명을 한글로 변환
-    features = features.rename(columns={
-        'premiumGasoline': '고급휘발유',
-        'gasoline': '휘발유',
-        'diesel': '경유',
-        'kerosene': '등유'
-    })
-    
-    target_cols = ["고급휘발유", "휘발유", "경유", "등유"]
+    # 타겟 컬럼 (영어)
+    target_cols = ["premiumGasoline", "gasoline", "diesel", "kerosene"]
     for col in target_cols:
         if col not in features.columns:
-            raise ValueError(f"타겟 컬럼 '{col}'이 데이터에 존재하지 않습니다.")
-    
+            raise ValueError(f"Target column '{col}' does not exist.")
+
+    # 4) 배열 변환 후 정규화
     data_array = features.values.astype(float)
     normalized_data, scaler = normalize_data(data_array)
     
+    # 5) 시계열 데이터셋 생성
     look_back = 3
     X, Y_full = create_dataset(normalized_data, look_back)
     X, Y_full = prepare_data(X, Y_full)
@@ -43,25 +45,28 @@ def export_predictions():
     Y_full_np = Y_full.numpy()
     Y = Y_full_np[:, target_indices]
     
+    # 6) 모델 생성 및 학습
     input_dim = X.shape[2]
     hidden_dim = 50
     layer_dim = 1
     output_dim = len(target_cols)
-    
     model = LSTMModel(input_dim, hidden_dim, layer_dim, output_dim)
     model = train_model(model, X, torch.FloatTensor(Y))
     
+    # 7) 미래 예측 (7일)
     future_steps = 7
     last_sequence = normalized_data[-look_back:]
     future_predictions_all = predict_future(model, last_sequence, future_steps, scaler)
     future_predictions = future_predictions_all[:, target_indices]
     
+    # 8) 예측 결과를 CSV로 내보내기
     last_date = df['date'].iloc[-1]
     future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=future_steps)
     
     pred_df = pd.DataFrame(future_predictions, columns=target_cols, index=future_dates)
-    pred_df.to_csv("korean_fuel_predictions.csv")
-    print("예측 결과가 korean_fuel_predictions.csv 파일로 저장되었습니다.")
+    pred_df.to_csv("fuel_predictions.csv")
+    #pred_df.to_csv("/path/to/your/folder/fuel_predictions.csv")
+    print("Predictions have been saved to fuel_predictions.csv")
     print(pred_df)
 
 if __name__ == "__main__":
