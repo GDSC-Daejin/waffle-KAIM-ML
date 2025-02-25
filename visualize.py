@@ -7,23 +7,28 @@ import mplcursors
 
 def plot_results(dates, actual, future_dates, future_predictions):
     """
-    실제 데이터와 미래 예측값을 하나의 그래프로 시각화합니다.
+    [원리 설명]
+    - 과거 실제 데이터와 미래 예측값을 하나의 그래프로 시각화하는 함수입니다.
+    - x축에는 날짜, y축에는 타겟 변수(유가) 값이 표시되며,
+      미래 예측값은 스플라인 보간을 통해 부드러운 곡선으로 나타납니다.
+    - 마우스 오버 시 해당 시점의 날짜와 예측값을 툴팁으로 표시합니다.
     
-    :param dates: 과거 실제 데이터의 날짜 (datetime 시리즈)
-    :param actual: 실제 값 (shape: (N, 4))
-    :param future_dates: 미래 예측 날짜 (datetime 시리즈)
-    :param future_predictions: 예측값 (shape: (future_steps, 4))
+    파라미터:
+      - dates: 과거 실제 데이터의 날짜 (datetime 시리즈)
+      - actual: 과거 실제 값 (numpy 배열, shape: (N, 4))
+      - future_dates: 미래 예측 날짜 (datetime 시리즈)
+      - future_predictions: 미래 예측 값 (numpy 배열, shape: (future_steps, 4))
     """
     plt.figure(figsize=(14, 8))
-    # 4가지 연료(영어)
+    # 타겟 변수 4개: premiumGasoline, gasoline, diesel, kerosene
     fuel_types = ['premiumGasoline', 'gasoline', 'diesel', 'kerosene']
     ax = plt.gca()
     
-    # 실제 데이터 플롯
+    # 실제 데이터 플롯: 각 타겟 변수의 실제 값을 점과 선으로 표시
     for i, fuel in enumerate(fuel_types):
         ax.plot(dates, actual[:, i], label=f"{fuel} (actual)", marker='o', linestyle='-')
     
-    # 미래 예측 (스플라인 보간)
+    # 미래 예측 데이터 플롯: 스플라인 보간을 사용하여 부드러운 곡선으로 표현
     future_dates_num = mdates.date2num(future_dates)
     for i, fuel in enumerate(fuel_types):
         y_future = future_predictions[:, i]
@@ -32,6 +37,7 @@ def plot_results(dates, actual, future_dates, future_predictions):
         y_smooth = spline(x_new)
         x_new_dates = mdates.num2date(x_new)
         line_future, = ax.plot(x_new_dates, y_smooth, label=f"{fuel} (predicted)", linestyle='--', linewidth=2)
+        # mplcursors를 사용하여 마우스 오버 시 데이터 점 정보를 표시합니다.
         cursor = mplcursors.cursor(line_future, hover=True)
         @cursor.connect("add")
         def on_add(sel):

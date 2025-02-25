@@ -4,12 +4,13 @@ import torch.optim as optim
 
 def train_model(model, X_train, Y_train, epochs=100, batch_size=32):
     """
-    LSTM 모델을 학습하는 함수입니다.
-    :param model: 학습할 모델
-    :param X_train: 입력 데이터
-    :param Y_train: 타겟 데이터
-    :param epochs: 전체 에포크 수
-    :param batch_size: 배치 크기
+    [원리 설명]
+    - 주어진 학습 데이터(X_train)와 타겟 데이터(Y_train)를 사용하여 LSTM 모델을 학습시킵니다.
+    - 손실 함수로는 MSELoss(평균제곱오차)를 사용하고, Adam 옵티마이저를 통해 가중치를 업데이트합니다.
+    - 에포크와 배치 단위로 학습을 진행하며, 일정 간격마다 손실 값을 출력하여 학습 진행 상황을 모니터링합니다.
+    
+    반환:
+      - 학습이 완료된 모델
     """
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters())
