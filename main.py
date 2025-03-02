@@ -3,19 +3,21 @@
 """
 MongoDB 기반 멀티 모델 앙상블 유가 예측 모델
 ----------------------------------------------------
-이 코드는 여러 최신 연구 및 논문(예: Hyndman & Athanasopoulos, ensemble forecast 연구 등)을 
-참고하여 제작되었습니다.
+이 코드는 여러 최신 연구(예: Hyndman & Athanasopoulos, Ensemble Forecast 관련 논문 등)를 참고하여 제작되었습니다.
+
 주요 기법:
-    - **데이터 통합:** MongoDB에 저장된 국내 경제 지표와 유가 데이터를 통합하여 사용.
-    - **특성 엔지니어링:** 이동평균, lag, 차분 등 시계열 기법을 활용하여 예측에 유용한 특성 생성.
-      (참고: "Forecasting: Principles and Practice")
-    - **모델 앙상블:** ARIMA, Prophet, XGBoost, LightGBM, LSTM 모델의 예측을 앙상블하여 예측 성능 개선.
-      (참고: Ensemble Learning 관련 연구)
-    - **비동기(병렬) 처리:** ProcessPoolExecutor를 사용하여 각 유종별 예측 작업을 병렬로 실행.
-    - **결과 정리:** 예측 결과를 날짜별, 유종별, 지역별로 JSON 파일에 저장.
+    - 데이터 통합: MongoDB에 저장된 국내 경제 지표와 유가 데이터를 통합하여 사용.
+      * 시작 날짜(2019-02-20)부터 어제까지의 데이터를 수동으로 조회 (컬렉션 이름은 "Date_YYYY_MM_DD" 형식)
+      * ThreadPoolExecutor와 각 Future에 타임아웃을 설정해 한 컬렉션의 지연이 전체를 멈추지 않도록 하고,
+        각 컬렉션 조회 전 0.01초 딜레이를 부여.
+      * 만약 5초 동안 응답이 없으면 최대 3회까지 재시도합니다.
+    - 특성 엔지니어링: 이동평균(MA)와 lag 특성을 생성하여 시계열의 추세와 단기 패턴을 포착.
+    - 모델 앙상블: ARIMA, Prophet, XGBoost, LightGBM, LSTM 모델의 예측을 단순 평균 방식으로 앙상블.
+    - 비동기(병렬) 처리: ProcessPoolExecutor를 사용하여 4개 유종(휘발유, 경유, 고급휘발유, 등유)의 예측 작업을 동시에 실행.
+    - 결과 정리: 최종 예측 결과를 날짜별, 유종별, 지역별로 JSON 파일에 저장.
 """
 
-import os, logging, time, json, warnings, joblib, numpy as np, pandas as pd
+import os, logging, time, json, warnings, joblib, numpy as np, pandas as pd, re
 from datetime import datetime, timedelta
 import concurrent.futures
 
@@ -61,7 +63,7 @@ memory = joblib.Memory(location=CACHE_DIR, verbose=0)
 from dotenv import load_dotenv
 load_dotenv()
 
-# MongoDB 연결 설정
+# MongoDB 연결 설정 (환경변수에서 불러옴)
 MONGO_URI = os.environ.get("MONGO_URI")
 DB_NAME = os.environ.get("DB_NAME")
 
@@ -75,61 +77,111 @@ if torch.cuda.is_available():
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"사용 중인 디바이스: {DEVICE}")
 
-# 로깅 설정 (각 작업별 로그는 /logs/현재날짜_시간 폴더에 저장)
+# 로깅 설정 (파일과 콘솔 모두 출력)
 def setup_logger(name, log_file, level=logging.INFO):
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    handler  = logging.FileHandler(log_file)
-    handler.setFormatter(formatter)
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()  # 콘솔 출력용
+    stream_handler.setFormatter(formatter)
     logger_obj = logging.getLogger(name)
     logger_obj.setLevel(level)
     if not logger_obj.handlers:
-        logger_obj.addHandler(handler)
+        logger_obj.addHandler(file_handler)
+        logger_obj.addHandler(stream_handler)
     return logger_obj
 
 current_log_folder = os.path.join(LOG_DIR, datetime.now().strftime("%Y%m%d_%H%M%S"))
 os.makedirs(current_log_folder, exist_ok=True)
 main_logger = setup_logger('main', os.path.join(current_log_folder, 'forecast.log'))
 
+# --- 수동 컬렉션 이름 생성 함수 ---
+def generate_collection_names(start_date, end_date):
+    """ 시작 날짜부터 종료 날짜까지 "Date_YYYY_MM_DD" 형식의 컬렉션 이름 리스트를 생성 """
+    collection_names = []
+    current_date = start_date
+    while current_date <= end_date:
+        collection_names.append(current_date.strftime("Date_%Y_%m_%d"))
+        current_date += timedelta(days=1)
+    return collection_names
+
+# --- 개별 컬렉션 데이터 조회 함수 (재시도 로직 포함) ---
+def load_collection_data(db, coll_name, max_retries=3, retry_delay=5):
+    """
+    주어진 컬렉션 이름에 대해 데이터를 조회하여 DataFrame으로 변환합니다.
+    응답이 없으면 최대 max_retries회 재시도하며, 각 재시도 사이에 retry_delay 초 대기합니다.
+    """
+    for attempt in range(max_retries):
+        try:
+            docs = list(db[coll_name].find({}, {"_id": 0}))
+            main_logger.info(f"컬렉션 {coll_name}: {len(docs)}개의 도큐먼트 조회 (시도 {attempt+1}/{max_retries})")
+            return pd.DataFrame(docs) if docs else None
+        except Exception as e:
+            main_logger.error(f"컬렉션 {coll_name} 조회 실패 (시도 {attempt+1}/{max_retries}): {e}")
+            time.sleep(retry_delay)
+    return None
+
 # =============================================================================
-# 1. MongoDB 데이터 로드 및 전처리 (캐싱 적용)
+# 1. MongoDB 데이터 로드 및 전처리 (수동 컬렉션 이름 사용, 병렬 조회 + 타임아웃 및 재시도 적용)
 # =============================================================================
 @memory.cache
-def load_data_from_mongo(mongo_uri, db_name):
-    main_logger.info("MongoDB 데이터 로드 시작")
+def load_data_from_mongo(mongo_uri, db_name, start_date, end_date):
+    main_logger.info("MongoDB 데이터 로드 시작 (수동 날짜 범위)")
     client = MongoClient(mongo_uri)
+    main_logger.info("MongoDB 연결 성공")
     db = client[db_name]
-    # 컬렉션 이름이 "Date_"로 시작하는 모든 컬렉션을 불러옴
-    coll_names = [name for name in db.list_collection_names() if name.startswith("Date_")]
-    main_logger.info(f"발견된 컬렉션 수: {len(coll_names)}")
+    main_logger.info("데이터베이스 선택 완료")
+    
+    # 수동으로 컬렉션 이름 생성 (예: 2019-02-20부터 어제까지)
+    collection_names = generate_collection_names(start_date, end_date)
+    main_logger.info(f"생성된 컬렉션 목록: {collection_names}")
+    
     total_docs = 0
     df_list = []
-    for coll in coll_names:
-        docs = list(db[coll].find({}, {"_id":0}))
-        count_docs = len(docs)
-        total_docs += count_docs
-        main_logger.info(f"컬렉션 {coll}: {count_docs}개의 도큐먼트")
-        if docs:
-            temp_df = pd.DataFrame(docs)
-            df_list.append(temp_df)
+    # ThreadPoolExecutor를 사용하여 병렬로 각 컬렉션을 조회 (각 제출 전에 0.05초 대기)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {}
+        for coll in collection_names:
+            futures[executor.submit(load_collection_data, db, coll)] = coll
+        for future in concurrent.futures.as_completed(futures, timeout=60):
+            coll = futures[future]
+            try:
+                df_coll = future.result(timeout=30)
+                if df_coll is not None:
+                    total_docs += len(df_coll)
+                    df_list.append(df_coll)
+            except concurrent.futures.TimeoutError:
+                main_logger.error(f"컬렉션 {coll} 조회 시간이 초과되었습니다.")
+            except Exception as e:
+                main_logger.error(f"컬렉션 {coll} 조회 중 오류 발생: {e}")
+    main_logger.info(f"전체 도큐먼트 수: {total_docs}")
+    client.close()
     if df_list:
         df = pd.concat(df_list, ignore_index=True)
     else:
         df = pd.DataFrame()
-    main_logger.info(f"전체 도큐먼트 수: {total_docs}")
-    client.close()
     main_logger.info(f"MongoDB 데이터 로드 완료: {df.shape}")
     return df
 
 def load_and_preprocess_data():
-    df = load_data_from_mongo(MONGO_URI, DB_NAME)
+    # DB가 2019-02-20부터 어제까지 데이터가 준비되어 있다고 가정
+    start_date = datetime(2019, 2, 20)
+    end_date = datetime.today() - timedelta(days=1)
+    df = load_data_from_mongo(MONGO_URI, DB_NAME, start_date, end_date)
     df['date'] = pd.to_datetime(df['date'].str.replace('Date_', ''), format='%Y_%m_%d')
     df = df.sort_values('date').reset_index(drop=True)
     regions = ['National', 'Seoul', 'Busan', 'Daegu', 'Incheon', 'Gwangju', 'Daejeon', 'Ulsan',
                'Sejong', 'Gyeonggi', 'Gangwon', 'Chungbuk', 'Chungnam', 'Jeonbuk', 'Jeonnam',
                'Gyeongbuk', 'Gyeongnam']
     for fuel_type in ['gasoline', 'premiumGasoline', 'diesel', 'kerosene']:
-        if fuel_type in df.columns and isinstance(df[fuel_type].iloc[0], str):
-            df[fuel_type] = df[fuel_type].apply(lambda x: eval(x) if isinstance(x, str) else x)
+        if fuel_type in df.columns:
+            # 만약 데이터가 문자열이면 eval()로 리스트로 변환
+            if isinstance(df[fuel_type].iloc[0], str):
+                df[fuel_type] = df[fuel_type].apply(lambda x: eval(x) if isinstance(x, str) else x)
+            # 데이터가 리스트이면 내부의 문자열을 float으로 변환
+            elif isinstance(df[fuel_type].iloc[0], list):
+                df[fuel_type] = df[fuel_type].apply(lambda x: [float(item) for item in x] if isinstance(x, list) else x)
+            # 리스트의 길이가 지역 수와 동일하면 각 지역별 컬럼 생성
             if isinstance(df[fuel_type].iloc[0], list) and len(df[fuel_type].iloc[0]) == len(regions):
                 for i, region in enumerate(regions):
                     df[f'{fuel_type}_{region}'] = df[fuel_type].apply(lambda x: float(x[i]) if isinstance(x, list) else np.nan)
@@ -141,9 +193,7 @@ def load_and_preprocess_data():
             df[col] = df[col].astype('float32')
     numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
     fuel_types = ['gasoline', 'premiumGasoline', 'diesel', 'kerosene']
-    fuel_columns = {}
-    for ft in fuel_types:
-        fuel_columns[ft] = [col for col in df.columns if col.startswith(f"{ft}_")]
+    fuel_columns = {ft: [col for col in df.columns if col.startswith(f"{ft}_")] for ft in fuel_types}
     main_logger.info(f"예측 대상 변수: {fuel_columns}")
     main_logger.info(f"데이터 기간: {df['date'].min().strftime('%Y-%m-%d')} 부터 {df['date'].max().strftime('%Y-%m-%d')}, 총 {df.shape[0]}일")
     return df, numeric_cols, fuel_columns
@@ -160,11 +210,11 @@ def create_features(df, target_col):
     df['day'] = df['date'].dt.day
     df['day_of_week'] = df['date'].dt.dayofweek
     df['quarter'] = df['date'].dt.quarter
-    df['is_weekend'] = df['day_of_week'].isin([5,6]).astype(int)
+    df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
     for feature in [target_col]:
-        for window in [3,7,14]:
+        for window in [3, 7, 14]:
             df[f'{feature}_MA{window}'] = df[target_col].rolling(window=window).mean()
-        for lag in [1,2,3]:
+        for lag in [1, 2, 3]:
             df[f'{feature}_lag{lag}'] = df[target_col].shift(lag)
     df = df.dropna()
     main_logger.info(f"특성 생성 후 데이터 크기: {df.shape}")
@@ -179,10 +229,10 @@ class LSTMModel(nn.Module):
         super(LSTMModel, self).__init__()
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True,
                             dropout=dropout if num_layers > 1 else 0)
-        self.fc1 = nn.Linear(hidden_dim, hidden_dim//2)
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(hidden_dim//2, output_dim)
+        self.fc2 = nn.Linear(hidden_dim // 2, output_dim)
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
         last_time_step = lstm_out[:, -1, :]
@@ -304,14 +354,14 @@ def multi_model_forecasting(series, df_prophet, ml_train_X, ml_train_y, ml_model
 # 6. 유종별 예측 작업 함수 (비동기/병렬 처리용)
 # =============================================================================
 def forecast_fuel_type(fuel_type, df):
-    logger.info(f"예측 시작: {fuel_type}")
+    main_logger.info(f"예측 시작: {fuel_type}")
     fuel_columns = [col for col in df.columns if col.startswith(f"{fuel_type}_")]
     forecasts = {}
     for target_col in fuel_columns:
-        logger.info(f"{target_col} 예측 작업 시작.")
+        main_logger.info(f"{target_col} 예측 작업 시작.")
         ts = df.set_index('date')[target_col].dropna()
         if len(ts) < 50:
-            logger.warning(f"{target_col}: 데이터 부족하여 건너뜁니다.")
+            main_logger.warning(f"{target_col}: 데이터 부족하여 건너뜁니다.")
             continue
         train_series = ts[:-7]
         df_prophet = pd.DataFrame({'ds': train_series.index, 'y': train_series.values})
@@ -338,8 +388,8 @@ def forecast_fuel_type(fuel_type, df):
         ensemble_pred, _ = multi_model_forecasting(train_series, df_prophet, X_ml, y_ml,
                                                    model_xgb, model_lgb, lstm_model,
                                                    forecast_horizon=7, seq_length=30)
-        forecast_series = pd.Series(ensemble_pred, index=[ts.index[-1] + timedelta(days=i) for i in range(1,8)])
-        logger.info(f"{target_col} 예측 완료.")
+        forecast_series = pd.Series(ensemble_pred, index=[ts.index[-1] + timedelta(days=i) for i in range(1, 8)])
+        main_logger.info(f"{target_col} 예측 완료.")
         forecasts[target_col] = forecast_series
     return forecasts
 
@@ -356,9 +406,9 @@ def forecast_all_fuel_types(df):
             try:
                 result = future.result()
                 all_forecasts[ft] = result
-                logger.info(f"{ft} 예측 작업 완료.")
+                main_logger.info(f"{ft} 예측 작업 완료.")
             except Exception as e:
-                logger.error(f"{ft} 예측 작업 실패: {e}")
+                main_logger.error(f"{ft} 예측 작업 실패: {e}")
     return all_forecasts
 
 # =============================================================================
