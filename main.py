@@ -19,10 +19,6 @@ import os, logging, time, json, warnings, joblib, numpy as np, pandas as pd
 from datetime import datetime, timedelta
 import concurrent.futures
 
-# .env 파일 로드
-from dotenv import load_dotenv
-load_dotenv()
-
 # MongoDB 관련 라이브러리
 from pymongo import MongoClient
 
@@ -61,8 +57,11 @@ if not os.path.exists(LOG_DIR):
 # joblib 캐시 설정 (재실행 시 속도 향상)
 memory = joblib.Memory(location=CACHE_DIR, verbose=0)
 
+# .env 파일 로드 (환경변수 사용)
+from dotenv import load_dotenv
+load_dotenv()
+
 # MongoDB 연결 설정
-# 환경변수에서 DB 설정 로드
 MONGO_URI = os.environ.get("MONGO_URI")
 DB_NAME = os.environ.get("DB_NAME")
 
@@ -87,7 +86,6 @@ def setup_logger(name, log_file, level=logging.INFO):
         logger_obj.addHandler(handler)
     return logger_obj
 
-# 현재 시각 기반 로그 폴더 생성
 current_log_folder = os.path.join(LOG_DIR, datetime.now().strftime("%Y%m%d_%H%M%S"))
 os.makedirs(current_log_folder, exist_ok=True)
 main_logger = setup_logger('main', os.path.join(current_log_folder, 'forecast.log'))
@@ -103,9 +101,13 @@ def load_data_from_mongo(mongo_uri, db_name):
     # 컬렉션 이름이 "Date_"로 시작하는 모든 컬렉션을 불러옴
     coll_names = [name for name in db.list_collection_names() if name.startswith("Date_")]
     main_logger.info(f"발견된 컬렉션 수: {len(coll_names)}")
+    total_docs = 0
     df_list = []
     for coll in coll_names:
         docs = list(db[coll].find({}, {"_id":0}))
+        count_docs = len(docs)
+        total_docs += count_docs
+        main_logger.info(f"컬렉션 {coll}: {count_docs}개의 도큐먼트")
         if docs:
             temp_df = pd.DataFrame(docs)
             df_list.append(temp_df)
@@ -113,17 +115,15 @@ def load_data_from_mongo(mongo_uri, db_name):
         df = pd.concat(df_list, ignore_index=True)
     else:
         df = pd.DataFrame()
+    main_logger.info(f"전체 도큐먼트 수: {total_docs}")
     client.close()
     main_logger.info(f"MongoDB 데이터 로드 완료: {df.shape}")
     return df
 
 def load_and_preprocess_data():
-    # MongoDB에서 데이터 로드
     df = load_data_from_mongo(MONGO_URI, DB_NAME)
-    # 날짜 처리: "Date_" 접두어 제거 후 정렬
     df['date'] = pd.to_datetime(df['date'].str.replace('Date_', ''), format='%Y_%m_%d')
     df = df.sort_values('date').reset_index(drop=True)
-    # 지역별 연료 가격 데이터 처리: 문자열 리스트 -> 수치형 리스트 변환
     regions = ['National', 'Seoul', 'Busan', 'Daegu', 'Incheon', 'Gwangju', 'Daejeon', 'Ulsan',
                'Sejong', 'Gyeonggi', 'Gangwon', 'Chungbuk', 'Chungnam', 'Jeonbuk', 'Jeonnam',
                'Gyeongbuk', 'Gyeongnam']
@@ -136,12 +136,10 @@ def load_and_preprocess_data():
             df = df.drop(fuel_type, axis=1)
     if 'area' in df.columns and isinstance(df['area'].iloc[0], str):
         df = df.drop('area', axis=1)
-    # 자료형 최적화: float64 -> float32
     for col in df.columns:
         if df[col].dtype == 'float64':
             df[col] = df[col].astype('float32')
     numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-    # 유종별 열 추출: 각 유종에 대해 전국 및 지역별 데이터 리스트
     fuel_types = ['gasoline', 'premiumGasoline', 'diesel', 'kerosene']
     fuel_columns = {}
     for ft in fuel_types:
@@ -152,7 +150,6 @@ def load_and_preprocess_data():
 
 # =============================================================================
 # 2. 특성 엔지니어링
-# (특성 엔지니어링: 원시 데이터를 이동평균, lag, 차분 등으로 변환해 예측에 유리한 형식으로 만듦)
 # =============================================================================
 @memory.cache
 def create_features(df, target_col):
@@ -164,7 +161,6 @@ def create_features(df, target_col):
     df['day_of_week'] = df['date'].dt.dayofweek
     df['quarter'] = df['date'].dt.quarter
     df['is_weekend'] = df['day_of_week'].isin([5,6]).astype(int)
-    # 이동평균 (MA)와 lag 특성은 시계열 데이터의 추세와 계절성을 포착하는 데 유용함.
     for feature in [target_col]:
         for window in [3,7,14]:
             df[f'{feature}_MA{window}'] = df[target_col].rolling(window=window).mean()
@@ -177,7 +173,6 @@ def create_features(df, target_col):
 
 # =============================================================================
 # 3. 딥러닝 모델 (LSTM) 정의 및 학습
-# (LSTM: 순환신경망(RNN)의 한 종류로, 장기 의존성을 학습하는 데 효과적임)
 # =============================================================================
 class LSTMModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers, output_dim=1, dropout=0.2):
@@ -227,7 +222,6 @@ def train_lstm_model(X_train, y_train, X_val, y_val, input_dim, epochs=30, batch
 
 # =============================================================================
 # 4. 각 모델별 예측 함수
-# (ARIMA: 통계적 시계열 모델 / Prophet: Facebook Prophet, XGBoost/LightGBM: 부스팅 계열, LSTM: 딥러닝)
 # =============================================================================
 def forecast_arima(series, forecast_horizon=7, order=(5,1,0), seasonal_order=(0,0,0,0)):
     model = SARIMAX(series, order=order, seasonal_order=seasonal_order,
@@ -237,11 +231,9 @@ def forecast_arima(series, forecast_horizon=7, order=(5,1,0), seasonal_order=(0,
     return pred.predicted_mean
 
 def get_korean_holidays(years):
-    # 사용자 정의 공휴일 함수 (한국의 주요 공휴일을 직접 정의할 수 있음)
     holidays = []
     for year in years:
         holidays.append({'holiday': 'New Year', 'ds': f'{year}-01-01', 'lower_window': 0, 'upper_window': 1})
-        # 추가: 설날, 추석, 광복절 등 필요 시 추가
     return pd.DataFrame(holidays)
 
 def forecast_prophet(df_prophet, forecast_horizon=7):
@@ -273,7 +265,6 @@ def forecast_ml_model(model, last_features, forecast_steps=7, seq_length=30):
 
 # =============================================================================
 # 5. 멀티 모델 예측 및 앙상블 함수
-# (각 모델의 예측값을 동일 가중치로 앙상블하는 단순 평균 기법 사용)
 # =============================================================================
 def multi_model_forecasting(series, df_prophet, ml_train_X, ml_train_y, ml_model_xgb, ml_model_lgb, lstm_model,
                             forecast_horizon=7, seq_length=30):
@@ -300,7 +291,6 @@ def multi_model_forecasting(series, df_prophet, ml_train_X, ml_train_y, ml_model
     if pred_prophet is not None:
         model_preds['Prophet'] = pred_prophet.values
     num_models = len(model_preds)
-    # 동일 가중치로 앙상블 (추후 가중치 최적화 기법 적용 가능)
     weights = {name: 1/num_models for name in model_preds.keys()}
     print("사용된 모델 가중치:", weights)
     ensemble_pred = np.zeros(forecast_horizon)
@@ -312,12 +302,9 @@ def multi_model_forecasting(series, df_prophet, ml_train_X, ml_train_y, ml_model
 
 # =============================================================================
 # 6. 유종별 예측 작업 함수 (비동기/병렬 처리용)
-# (각 유종별로 전국 및 지역별 예측 작업을 수행하며, MongoDB 데이터 및 경제 지표 등 
-#  모든 데이터를 활용하여 보다 정밀한 예측을 시도)
 # =============================================================================
 def forecast_fuel_type(fuel_type, df):
     logger.info(f"예측 시작: {fuel_type}")
-    # 해당 유종의 모든 열(전국 및 지역별)
     fuel_columns = [col for col in df.columns if col.startswith(f"{fuel_type}_")]
     forecasts = {}
     for target_col in fuel_columns:
@@ -326,11 +313,8 @@ def forecast_fuel_type(fuel_type, df):
         if len(ts) < 50:
             logger.warning(f"{target_col}: 데이터 부족하여 건너뜁니다.")
             continue
-        # 데이터 분할: 마지막 7일은 검증/예측을 위해 제외
         train_series = ts[:-7]
-        # Prophet 모델용 데이터 준비 (경제 지표 등 추가 가능)
         df_prophet = pd.DataFrame({'ds': train_series.index, 'y': train_series.values})
-        # 특성 엔지니어링: 여기서는 30일 window 이동평균 및 lag를 생성
         X_ml, y_ml = [], []
         values = train_series.values
         for i in range(30, len(values)):
@@ -341,12 +325,10 @@ def forecast_fuel_type(fuel_type, df):
         train_size = len(X_ml) - 7
         X_train_ml, y_train_ml = X_ml[:train_size], y_ml[:train_size]
         X_val_ml, y_val_ml = X_ml[train_size:], y_ml[train_size:]
-        # 머신러닝 모델 학습 (XGBoost, LightGBM)
         model_xgb = xgb.XGBRegressor(n_estimators=100, learning_rate=0.01, random_state=RANDOM_SEED)
         model_xgb.fit(X_train_ml, y_train_ml)
         model_lgb = lgb.LGBMRegressor(n_estimators=100, learning_rate=0.01, random_state=RANDOM_SEED)
         model_lgb.fit(X_train_ml, y_train_ml)
-        # 딥러닝 모델 학습 (LSTM)
         X_train_dl = X_train_ml.reshape(-1, 30, 1)
         X_val_dl = X_val_ml.reshape(-1, 30, 1)
         y_train_dl = torch.FloatTensor(y_train_ml)
@@ -363,7 +345,6 @@ def forecast_fuel_type(fuel_type, df):
 
 # =============================================================================
 # 7. 최종 예측: 모든 유종에 대해 일주일치 예측 (병렬 처리)
-# (ProcessPoolExecutor를 사용하여 4개 유종의 예측 작업을 동시에 수행)
 # =============================================================================
 def forecast_all_fuel_types(df):
     fuel_types = ['gasoline', 'diesel', 'premiumGasoline', 'kerosene']
@@ -384,20 +365,16 @@ def forecast_all_fuel_types(df):
 # 메인 실행부
 # =============================================================================
 def main():
-    # MongoDB에서 데이터를 불러오고 전처리
     df, numeric_cols, fuel_columns = load_and_preprocess_data()
     print("\n데이터 일부:")
     print(df.head())
     
-    # 예를 들어, gasoline_National을 대상으로 특성 엔지니어링 수행
     df_features = create_features(df, 'gasoline_National')
     print("\n특성 엔지니어링 완료 후 데이터 일부:")
     print(df_features.head())
     
-    # 병렬(비동기) 처리로 모든 유종 예측 실행
     all_forecasts = forecast_all_fuel_types(df_features)
     
-    # 최종 결과물을 날짜별, 유종별, 지역별로 묶어 JSON으로 출력
     final_result = {}
     for fuel, forecasts in all_forecasts.items():
         final_result[fuel] = {}
