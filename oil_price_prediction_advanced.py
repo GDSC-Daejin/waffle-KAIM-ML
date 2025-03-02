@@ -71,7 +71,7 @@ except ImportError:
 warnings.filterwarnings('ignore')
 
 # 결과 저장 디렉토리 설정
-OUTPUT_DIR = '/Users/yangjunseok/Documents/CodeSpace/KAIM-ML/waffle-KAIM-ML/results'
+OUTPUT_DIR = '/home/ubuntu/KAIM/ML/waffle-KAIM-ML/results'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 시드 설정
@@ -85,6 +85,10 @@ if torch.cuda.is_available():
 # GPU 사용 가능 여부 확인
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"사용 중인 디바이스: {DEVICE}")
+
+# 한글 폰트 설정
+plt.rcParams['font.family'] = 'NanumGothic'  # 한글 폰트 문제 해결을 위한 설정
+plt.rcParams['axes.unicode_minus'] = False   # 마이너스 기호 깨짐 방지
 
 # =============================================================================
 # 1. 데이터 로드 및 전처리
@@ -101,13 +105,30 @@ def load_and_preprocess_data(file_path):
         tuple: (전처리된 데이터프레임, 수치형 열 목록, 타겟 컬럼명)
     """
     print(f"데이터 로드 중: {file_path}")
-    df = pd.read_csv(file_path)
+    try:
+        # 한글 인코딩 문제를 방지하기 위해 encoding 옵션 추가
+        df = pd.read_csv(file_path, encoding='utf-8')
+    except UnicodeDecodeError:
+        # UTF-8로 안되면 CP949(한글 Windows 기본 인코딩) 시도
+        df = pd.read_csv(file_path, encoding='cp949')
     
     print(f"원본 데이터 크기: {df.shape}")
+    print(f"컬럼 목록: {', '.join(df.columns)}")
     
     # 날짜 열 처리
-    df['date'] = pd.to_datetime(df['date'].str.replace('Date_', ''), format='%Y_%m_%d')
-    df = df.sort_values('date').reset_index(drop=True)
+    date_columns = [col for col in df.columns if 'date' in col.lower() or 'time' in col.lower()]
+    if date_columns:
+        date_col = date_columns[0]
+        print(f"날짜 컬럼으로 '{date_col}' 사용")
+        try:
+            df[date_col] = pd.to_datetime(df[date_col])
+            df = df.sort_values(by=date_col)
+            df.set_index(date_col, inplace=True)
+            df = df.reset_index()  # 인덱스 리셋하여 날짜를 다시 컬럼으로
+        except Exception as e:
+            print(f"날짜 변환 중 오류 발생: {e}")
+    else:
+        print("날짜 컬럼을 찾을 수 없습니다. 데이터에 날짜 정보가 있는지 확인하세요.")
     
     # 지역별 연료 가격 데이터 처리 (문자열 형태의 리스트를 실제 값으로 변환)
     regions = ['National', 'Seoul', 'Busan', 'Daegu', 'Incheon', 'Gwangju', 'Daejeon', 'Ulsan', 
@@ -133,7 +154,25 @@ def load_and_preprocess_data(file_path):
         df = df.drop('area', axis=1)
     
     # 결측치 처리
+    missing_values = df.isnull().sum()
     print(f"결측치 개수: {df.isnull().sum().sum()}")
+    if df.isnull().sum().sum() > 0:
+        print("컬럼별 결측치:")
+        for col, count in missing_values[missing_values > 0].items():
+            print(f"  - {col}: {count}개")
+        
+        # 결측치가 많은 컬럼 제거 (80% 이상이 결측치인 경우)
+        threshold = len(df) * 0.2
+        df = df.dropna(axis=1, thresh=threshold)
+        
+        # 남은 결측치는 수치형/범주형에 따라 다르게 처리
+        for col in df.columns:
+            if df[col].dtype.kind in 'fc':  # float나 complex
+                df[col] = df[col].fillna(df[col].median())  # 중앙값으로 대체
+            elif df[col].dtype.kind in 'iu':  # integer
+                df[col] = df[col].fillna(int(df[col].median()))
+            else:  # object (문자열) 등
+                df[col] = df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else "Unknown")
     
     # 데이터 유형 최적화
     for col in df.columns:
@@ -144,14 +183,32 @@ def load_and_preprocess_data(file_path):
     numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
     
     # 타겟 컬럼 설정 (국내 전체 휘발유 가격)
-    target_col = 'gasoline_National'
+    # 컬럼명에 'gasoline' 또는 '휘발유'가 포함된 컬럼 찾기
+    potential_target_cols = [col for col in df.columns if 'gasoline' in col.lower() or '휘발유' in str(col)]
+    
+    if 'gasoline_National' in df.columns:
+        target_col = 'gasoline_National'
+    elif potential_target_cols:
+        target_col = potential_target_cols[0]
+        print(f"'gasoline_National'을 찾을 수 없어 '{target_col}'을 타겟으로 사용합니다.")
+    else:
+        # 타겟 컬럼이 없으면 사용자에게 선택 요청
+        print("경고: 휘발유 가격 관련 컬럼을 찾을 수 없습니다.")
+        print("수치형 컬럼 목록:")
+        for i, col in enumerate(numeric_cols):
+            print(f"{i}: {col}")
+        
+        # 기본값으로 첫 번째 수치형 변수 사용
+        target_col = numeric_cols[0] if numeric_cols else df.columns[0]
+        print(f"기본값으로 '{target_col}'을 타겟으로 설정합니다.")
     
     print(f"전처리 후 데이터 크기: {df.shape}, 수치형 변수 수: {len(numeric_cols)}")
     
     # 기본 정보 출력
-    print("\n데이터 기간:", df['date'].min().strftime('%Y-%m-%d'), "부터", 
-          df['date'].max().strftime('%Y-%m-%d'), "까지")
-    print(f"총 {df.shape[0]}일 데이터")
+    if 'date' in df.columns:
+        print("\n데이터 기간:", df['date'].min().strftime('%Y-%m-%d'), "부터", 
+              df['date'].max().strftime('%Y-%m-%d'), "까지")
+        print(f"총 {df.shape[0]}일 데이터")
     
     return df, numeric_cols, target_col
 

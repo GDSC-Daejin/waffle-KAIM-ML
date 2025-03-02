@@ -1,0 +1,27 @@
+2025-03-02 17:05:43,239 - INFO - 데이터 로드 중: ./korea_economic_data.csv
+2025-03-02 17:05:43,270 - INFO - 원본 데이터 크기: (2197, 20)
+2025-03-02 17:05:43,698 - INFO - 예측 대상 변수: {'gasoline': ['gasoline_National', 'gasoline_Seoul', 'gasoline_Busan', 'gasoline_Daegu', 'gasoline_Incheon', 'gasoline_Gwangju', 'gasoline_Daejeon', 'gasoline_Ulsan', 'gasoline_Sejong', 'gasoline_Gyeonggi', 'gasoline_Gangwon', 'gasoline_Chungbuk', 'gasoline_Chungnam', 'gasoline_Jeonbuk', 'gasoline_Jeonnam', 'gasoline_Gyeongbuk', 'gasoline_Gyeongnam'], 'premiumGasoline': ['premiumGasoline_National', 'premiumGasoline_Seoul', 'premiumGasoline_Busan', 'premiumGasoline_Daegu', 'premiumGasoline_Incheon', 'premiumGasoline_Gwangju', 'premiumGasoline_Daejeon', 'premiumGasoline_Ulsan', 'premiumGasoline_Sejong', 'premiumGasoline_Gyeonggi', 'premiumGasoline_Gangwon', 'premiumGasoline_Chungbuk', 'premiumGasoline_Chungnam', 'premiumGasoline_Jeonbuk', 'premiumGasoline_Jeonnam', 'premiumGasoline_Gyeongbuk', 'premiumGasoline_Gyeongnam'], 'diesel': ['diesel_National', 'diesel_Seoul', 'diesel_Busan', 'diesel_Daegu', 'diesel_Incheon', 'diesel_Gwangju', 'diesel_Daejeon', 'diesel_Ulsan', 'diesel_Sejong', 'diesel_Gyeonggi', 'diesel_Gangwon', 'diesel_Chungbuk', 'diesel_Chungnam', 'diesel_Jeonbuk', 'diesel_Jeonnam', 'diesel_Gyeongbuk', 'diesel_Gyeongnam'], 'kerosene': ['kerosene_National', 'kerosene_Seoul', 'kerosene_Busan', 'kerosene_Daegu', 'kerosene_Incheon', 'kerosene_Gwangju', 'kerosene_Daejeon', 'kerosene_Ulsan', 'kerosene_Sejong', 'kerosene_Gyeonggi', 'kerosene_Gangwon', 'kerosene_Chungbuk', 'kerosene_Chungnam', 'kerosene_Jeonbuk', 'kerosene_Jeonnam', 'kerosene_Gyeongbuk', 'kerosene_Gyeongnam']}
+2025-03-02 17:05:43,698 - INFO - 데이터 기간: 2019-02-20 부터 2025-02-24, 총 2197일
+2025-03-02 17:05:43,780 - INFO - === 특성 엔지니어링 시작 ===
+2025-03-02 17:05:43,788 - INFO - 특성 생성 후 데이터 크기: (2184, 95)
+2025-03-02 17:05:43,788 - INFO - === 특성 엔지니어링 완료 ===
+2025-03-02 17:05:43,995 - INFO - 예측 시작: gasoline
+2025-03-02 17:05:43,996 - INFO - gasoline_National 예측 작업 시작.
+2025-03-02 17:05:43,999 - INFO - 예측 시작: diesel
+2025-03-02 17:05:44,000 - INFO - diesel_National 예측 작업 시작.
+2025-03-02 17:05:44,003 - INFO - 예측 시작: premiumGasoline
+2025-03-02 17:05:44,003 - INFO - premiumGasoline_National 예측 작업 시작.
+2025-03-02 17:05:44,005 - INFO - 예측 시작: kerosene
+2025-03-02 17:05:44,006 - INFO - kerosene_National 예측 작업 시작.
+2025-03-02 17:18:23,731 - INFO - 데이터 로드 중: ./korea_economic_data.csv
+2025-03-02 17:18:23,762 - INFO - 원본 데이터 크기: (2197, 20)
+2025-03-02 17:18:24,194 - INFO - 예측 대상 변수: {'gasoline': ['gasoline_National', 'gasoline_Seoul', 'gasoline_Busan', 'gasoline_Daegu', 'gasoline_Incheon', 'gasoline_Gwangju', 'gasoline_Daejeon', 'gasoline_Ulsan', 'gasoline_Sejong', 'gasoline_Gyeonggi', 'gasoline_Gangwon', 'gasoline_Chungbuk', 'gasoline_Chungnam', 'gasoline_Jeonbuk', 'gasoline_Jeonnam', 'gasoline_Gyeongbuk', 'gasoline_Gyeongnam'], 'premiumGasoline': ['premiumGasoline_National', 'premiumGasoline_Seoul', 'premiumGasoline_Busan', 'premiumGasoline_Daegu', 'premiumGasoline_Incheon', 'premiumGasoline_Gwangju', 'premiumGasoline_Daejeon', 'premiumGasoline_Ulsan', 'premiumGasoline_Sejong', 'premiumGasoline_Gyeonggi', 'premiumGasoline_Gangwon', 'premiumGasoline_Chungbuk', 'premiumGasoline_Chungnam', 'premiumGasoline_Jeonbuk', 'premiumGasoline_Jeonnam', 'premiumGasoline_Gyeongbuk', 'premiumGasoline_Gyeongnam'], 'diesel': ['diesel_National', 'diesel_Seoul', 'diesel_Busan', 'diesel_Daegu', 'diesel_Incheon', 'diesel_Gwangju', 'diesel_Daejeon', 'diesel_Ulsan', 'diesel_Sejong', 'diesel_Gyeonggi', 'diesel_Gangwon', 'diesel_Chungbuk', 'diesel_Chungnam', 'diesel_Jeonbuk', 'diesel_Jeonnam', 'diesel_Gyeongbuk', 'diesel_Gyeongnam'], 'kerosene': ['kerosene_National', 'kerosene_Seoul', 'kerosene_Busan', 'kerosene_Daegu', 'kerosene_Incheon', 'kerosene_Gwangju', 'kerosene_Daejeon', 'kerosene_Ulsan', 'kerosene_Sejong', 'kerosene_Gyeonggi', 'kerosene_Gangwon', 'kerosene_Chungbuk', 'kerosene_Chungnam', 'kerosene_Jeonbuk', 'kerosene_Jeonnam', 'kerosene_Gyeongbuk', 'kerosene_Gyeongnam']}
+2025-03-02 17:18:24,194 - INFO - 데이터 기간: 2019-02-20 부터 2025-02-24, 총 2197일
+2025-03-02 17:18:24,416 - INFO - 예측 시작: gasoline
+2025-03-02 17:18:24,417 - INFO - gasoline_National 예측 작업 시작.
+2025-03-02 17:18:24,420 - INFO - 예측 시작: diesel
+2025-03-02 17:18:24,421 - INFO - diesel_National 예측 작업 시작.
+2025-03-02 17:18:24,424 - INFO - 예측 시작: premiumGasoline
+2025-03-02 17:18:24,424 - INFO - premiumGasoline_National 예측 작업 시작.
+2025-03-02 17:18:24,426 - INFO - 예측 시작: kerosene
+2025-03-02 17:18:24,427 - INFO - kerosene_National 예측 작업 시작.
