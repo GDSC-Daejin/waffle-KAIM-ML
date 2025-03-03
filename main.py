@@ -79,7 +79,7 @@ print(f"사용 중인 디바이스: {DEVICE}")
 
 # 로깅 설정 (파일과 콘솔 모두 출력)
 def setup_logger(name, log_file, level=logging.INFO):
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter('%(asctime)s - %(levellevelname)s - %(message)s')
     file_handler = logging.FileHandler(log_file)
     file_handler.setFormatter(formatter)
     stream_handler = logging.StreamHandler()  # 콘솔 출력용
@@ -121,9 +121,7 @@ def load_collection_data(db, coll_name, max_retries=3, retry_delay=5):
             time.sleep(retry_delay)
     return None
 
-# =============================================================================
-# 1. MongoDB 데이터 로드 및 전처리 (수동 컬렉션 이름 사용, 병렬 조회 + 타임아웃 및 재시도 적용)
-# =============================================================================
+# --- MongoDB 데이터 로드 함수 (수동 컬렉션 이름 사용, 병렬 조회 + 타임아웃 및 재시도 적용) ---
 @memory.cache
 def load_data_from_mongo(mongo_uri, db_name, start_date, end_date):
     main_logger.info("MongoDB 데이터 로드 시작 (수동 날짜 범위)")
@@ -163,11 +161,99 @@ def load_data_from_mongo(mongo_uri, db_name, start_date, end_date):
     main_logger.info(f"MongoDB 데이터 로드 완료: {df.shape}")
     return df
 
+# CSV와 MongoDB 데이터를 통합하여 로드하는 함수
+def load_data_from_csv_and_db(mongo_uri, db_name, csv_path):
+    """
+    CSV 파일에서 기본 데이터를 로드하고, 
+    필요한 경우 MongoDB에서 최신 데이터를 추가로 가져옵니다.
+    """
+    main_logger.info("CSV 및 MongoDB 통합 데이터 로드 시작")
+    
+    # 1. CSV 파일 로드
+    try:
+        csv_file = os.path.join(CACHE_DIR, 'korea_economic_data.csv')
+        if os.path.exists(csv_file):
+            main_logger.info(f"CSV 파일 로드 중: {csv_file}")
+            df = pd.read_csv(csv_file)
+            
+            # date 컬럼이 문자열 'Date_YYYY_MM_DD' 형식이면 변환
+            if 'date' in df.columns and isinstance(df['date'].iloc[0], str):
+                if df['date'].iloc[0].startswith('Date_'):
+                    df['date'] = pd.to_datetime(df['date'].str.replace('Date_', ''), format='%Y_%m_%d')
+                else:
+                    df['date'] = pd.to_datetime(df['date'])
+            
+            main_logger.info(f"CSV 파일에서 {len(df)}개 레코드 로드 완료")
+            
+            # 최신 날짜 확인
+            latest_date = df['date'].max()
+            main_logger.info(f"CSV 데이터 최신 날짜: {latest_date.strftime('%Y-%m-%d')}")
+            
+            # 어제 날짜 계산
+            yesterday = datetime.today() - timedelta(days=1)
+            
+            # 최신 데이터가 어제보다 오래된 경우, MongoDB에서 추가 데이터 로드
+            if latest_date.date() < yesterday.date():
+                main_logger.info(f"최신 데이터 필요: {latest_date.strftime('%Y-%m-%d')} 이후 ~ {yesterday.strftime('%Y-%m-%d')}까지")
+                
+                # 다음 날부터 어제까지의 데이터 로드
+                start_date = latest_date + timedelta(days=1)
+                new_data = load_data_from_mongo(mongo_uri, db_name, start_date, yesterday)
+                
+                if not new_data.empty:
+                    main_logger.info(f"MongoDB에서 {len(new_data)}개의 새 레코드를 로드했습니다")
+                    
+                    # 데이터 통합 전 컬럼 형식 확인 및 조정
+                    for col in new_data.columns:
+                        if col in df.columns and df[col].dtype != new_data[col].dtype:
+                            try:
+                                new_data[col] = new_data[col].astype(df[col].dtype)
+                            except:
+                                main_logger.warning(f"컬럼 {col}의 데이터 형식을 맞추지 못했습니다")
+                    
+                    # 데이터 통합
+                    df = pd.concat([df, new_data], ignore_index=True)
+                    
+                    # 중복 제거 (혹시 모를 중복을 대비)
+                    df = df.drop_duplicates(subset=['date']).reset_index(drop=True)
+                    
+                    # 통합된 데이터를 CSV에 저장 (최신 상태 유지)
+                    backup_path = os.path.join(CACHE_DIR, 'korea_economic_data_backup.csv')
+                    if os.path.exists(csv_file):
+                        main_logger.info(f"기존 CSV 파일 백업: {backup_path}")
+                        try:
+                            # 기존 파일 백업
+                            import shutil
+                            shutil.copy2(csv_file, backup_path)
+                        except Exception as e:
+                            main_logger.error(f"파일 백업 중 오류: {e}")
+                    
+                    main_logger.info(f"통합 데이터를 CSV에 저장: {csv_file}")
+                    df.to_csv(csv_file, index=False)
+                else:
+                    main_logger.info("MongoDB에서 새로운 데이터를 찾을 수 없습니다")
+            else:
+                main_logger.info("CSV 데이터가 최신 상태입니다. MongoDB 조회를 건너뜁니다.")
+            
+            return df
+        else:
+            main_logger.error(f"CSV 파일을 찾을 수 없음: {csv_file}")
+            # CSV 파일이 없으면 MongoDB 데이터만으로 진행
+            return load_data_from_mongo(mongo_uri, db_name, datetime(2019, 2, 20), datetime.today() - timedelta(days=1))
+    
+    except Exception as e:
+        main_logger.error(f"CSV 및 MongoDB 통합 데이터 로드 중 오류: {str(e)}")
+        # 오류 발생 시 MongoDB에서 시도
+        return load_data_from_mongo(mongo_uri, db_name, datetime(2019, 2, 20), datetime.today() - timedelta(days=1))
+
 def load_and_preprocess_data():
     # DB가 2019-02-20부터 어제까지 데이터가 준비되어 있다고 가정
     start_date = datetime(2019, 2, 20)
     end_date = datetime.today() - timedelta(days=1)
-    df = load_data_from_mongo(MONGO_URI, DB_NAME, start_date, end_date)
+    
+    # CSV와 MongoDB 통합 데이터 로드
+    df = load_data_from_csv_and_db(MONGO_URI, DB_NAME, 'korea_economic_data.csv')
+    
     df['date'] = pd.to_datetime(df['date'].str.replace('Date_', ''), format='%Y_%m_%d')
     df = df.sort_values('date').reset_index(drop=True)
     regions = ['National', 'Seoul', 'Busan', 'Daegu', 'Incheon', 'Gwangju', 'Daejeon', 'Ulsan',
