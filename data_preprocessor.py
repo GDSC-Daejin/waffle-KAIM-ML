@@ -306,18 +306,19 @@ def generate_rolling_features(data, roll_cols, windows=[3, 7, 14]):
 
 def apply_feature_engineering(df, target_cols):
     """특성 공학 파이프라인 함수"""
-    # 인덱스 리셋으로 중복 인덱스 문제 방지
+    # 원본 데이터 복사
     df = df.reset_index(drop=True)
     
-    # 날짜 관련 특성 추가
-    new_features = pd.DataFrame(index=df.index)  # 동일한 인덱스를 가진 빈 DataFrame 생성
+    # 특성 저장을 위한 딕셔너리 생성 (프래그먼테이션 방지)
+    feature_dict = {}
     
+    # 날짜 관련 특성 추가
     if 'date' in df.columns:
-        new_features['day_of_week'] = df['date'].dt.dayofweek
-        new_features['month'] = df['date'].dt.month
-        new_features['quarter'] = df['date'].dt.quarter
-        new_features['year'] = df['date'].dt.year
-        new_features['day_of_year'] = df['date'].dt.dayofyear
+        feature_dict['day_of_week'] = df['date'].dt.dayofweek.values
+        feature_dict['month'] = df['date'].dt.month.values
+        feature_dict['quarter'] = df['date'].dt.quarter.values
+        feature_dict['year'] = df['date'].dt.year.values
+        feature_dict['day_of_year'] = df['date'].dt.dayofyear.values
     
     # 국제 유가 관련 컬럼 식별
     oil_cols = [col for col in df.columns if any(s in col.lower() for s in ['dubai', 'brent', 'wti'])]
@@ -327,37 +328,42 @@ def apply_feature_engineering(df, target_cols):
     
     # 지연 특성 생성
     lag_features = oil_cols + econ_cols + target_cols
-    
-    # 각 지연 특성을 개별적으로 계산하고 추가
     for col in lag_features:
         if col in df.columns:
             for lag in [1, 2, 3, 7]:
-                new_features[f'{col}_lag_{lag}'] = df[col].shift(lag)
+                feature_dict[f'{col}_lag_{lag}'] = df[col].shift(lag).values
     
     # 이동 평균/표준편차 특성 생성
+    rolling_features = {}
     for col in lag_features:
         if col in df.columns:
             for window in [3, 7, 14]:
-                new_features[f'{col}_roll_mean_{window}'] = df[col].rolling(window=window).mean()
-                new_features[f'{col}_roll_std_{window}'] = df[col].rolling(window=window).std()
+                rolling_mean = df[col].rolling(window=window).mean().values
+                rolling_std = df[col].rolling(window=window).std().values
+                feature_dict[f'{col}_roll_mean_{window}'] = rolling_mean
+                feature_dict[f'{col}_roll_std_{window}'] = rolling_std
     
     # 유가 비율 특성 (국제 유가간 비율)
+    ratio_features = {}
     if len(oil_cols) >= 2:
         for i, col1 in enumerate(oil_cols):
             for col2 in oil_cols[i+1:]:
-                new_features[f'{col1}_to_{col2}_ratio'] = df[col1] / df[col2]
+                feature_dict[f'{col1}_to_{col2}_ratio'] = (df[col1] / df[col2].replace(0, np.nan)).values
     
     # 국제 유가와 국내 유가 간의 비율/차이
     for oil_col in oil_cols:
         for target_col in target_cols:
             if oil_col in df.columns and target_col in df.columns:
-                new_features[f'{oil_col}_to_{target_col}_ratio'] = df[oil_col] / df[target_col]
-                new_features[f'{oil_col}_to_{target_col}_diff'] = df[oil_col] - df[target_col]
+                feature_dict[f'{oil_col}_to_{target_col}_ratio'] = (df[oil_col] / df[target_col].replace(0, np.nan)).values
+                feature_dict[f'{oil_col}_to_{target_col}_diff'] = (df[oil_col] - df[target_col]).values
     
-    # 안전하게 데이터프레임 병합
-    new_df = pd.concat([df, new_features], axis=1)
+    # 모든 새로운 특성을 한 번에 DataFrame으로 변환 (프래그먼테이션 방지)
+    new_features_df = pd.DataFrame(feature_dict, index=df.index)
     
-    # NaN 값 처리 (ffill: 앞쪽 값으로 채우기, bfill: 뒤쪽 값으로 채우기)
-    new_df = new_df.fillna(method='ffill').fillna(method='bfill')
+    # 원본 데이터프레임과 효율적으로 병합
+    new_df = pd.concat([df, new_features_df], axis=1)
+    
+    # NaN 값 효율적 처리 (권장 메서드 사용)
+    new_df = new_df.ffill().bfill()
     
     return new_df

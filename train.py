@@ -9,99 +9,143 @@ from tqdm import tqdm
 import os
 from sklearn.model_selection import TimeSeriesSplit
 
-def train_model(model, X_train, Y_train, epochs=100, batch_size=32, learning_rate=0.001, 
-                validation_data=None, patience=10, verbose=1):
+def train_model(model, X_train, Y_train, X_val=None, Y_val=None, 
+               epochs=100, batch_size=64, learning_rate=0.001,
+               patience=10, verbose=1, device=None):
     """
-    단일 모델 학습 함수
+    모델 학습 함수
     
     Args:
-        model: 학습시킬 모델
-        X_train: 학습 입력 데이터
-        Y_train: 학습 타겟 데이터
-        epochs: 학습 에폭 수
-        batch_size: 배치 크기
+        model: 학습할 PyTorch 모델
+        X_train, Y_train: 학습 데이터
+        X_val, Y_val: 검증 데이터 (없으면 학습 데이터의 일부를 검증에 사용)
+        epochs: 학습 에포크 수
+        batch_size: 배치 크기 (성능 최적화를 위해 증가)
         learning_rate: 학습률
-        validation_data: (X_val, Y_val) 형태의 검증 데이터
-        patience: 조기 종료를 위한 인내심 횟수
+        patience: 조기 종료 인내심
         verbose: 출력 상세도
+        device: 학습에 사용할 디바이스
         
     Returns:
-        학습된 모델과 학습 기록
+        학습된 모델, 손실 기록
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    # 디바이스 설정
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=patience//2, factor=0.5)
+    model = model.to(device)
     
-    X_train = torch.tensor(X_train.numpy() if isinstance(X_train, torch.Tensor) else X_train, dtype=torch.float32).to(device)
-    Y_train = torch.tensor(Y_train.numpy() if isinstance(Y_train, torch.Tensor) else Y_train, dtype=torch.float32).to(device)
+    # 혼합 정밀도 연산 설정 (GPU 효율성 향상)
+    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
     
-    if validation_data:
-        X_val, Y_val = validation_data
-        X_val = torch.tensor(X_val.numpy() if isinstance(X_val, torch.Tensor) else X_val, dtype=torch.float32).to(device)
-        Y_val = torch.tensor(Y_val.numpy() if isinstance(Y_val, torch.Tensor) else Y_val, dtype=torch.float32).to(device)
+    # 옵티마이저 및 손실 함수 설정
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = torch.nn.MSELoss()
     
+    # 검증 데이터가 없으면 학습 데이터 분할
+    if X_val is None or Y_val is None:
+        val_size = int(0.2 * len(X_train))
+        X_val = X_train[-val_size:]
+        Y_val = Y_train[-val_size:]
+        X_train = X_train[:-val_size]
+        Y_train = Y_train[:-val_size]
+    
+    # 학습 데이터를 TensorDataset으로 변환
+    train_dataset = torch.utils.data.TensorDataset(X_train, Y_train)
+    val_dataset = torch.utils.data.TensorDataset(X_val, Y_val)
+    
+    # DataLoader 설정 (병렬 처리 향상)
+    num_workers = min(8, os.cpu_count()) if device.type == 'cuda' else 0
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, 
+        num_workers=num_workers, pin_memory=True if device.type == 'cuda' else False
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=batch_size*2, shuffle=False,
+        num_workers=num_workers, pin_memory=True if device.type == 'cuda' else False
+    )
+    
+    # 조기 종료를 위한 변수
     best_val_loss = float('inf')
+    no_improve_epochs = 0
     best_model_state = None
-    counter = 0
-    history = {'train_loss': [], 'val_loss': []}
+    train_losses, val_losses = [], []
     
+    # 학습 시작
     for epoch in range(epochs):
         model.train()
-        total_loss = 0
-        batch_count = 0
+        train_loss = 0
         
-        # 미니배치 학습
-        for i in range(0, len(X_train), batch_size):
-            batch_X = X_train[i:i+batch_size]
-            batch_Y = Y_train[i:i+batch_size]
+        # tqdm으로 진행률 표시
+        train_bar = tqdm(train_loader, desc=f'Epoch [{epoch+1}/{epochs}]') if verbose > 0 else train_loader
+        
+        for inputs, targets in train_bar:
+            # 데이터를 해당 디바이스로 이동
+            inputs, targets = inputs.to(device), targets.to(device)
             
             optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_Y)
-            loss.backward()
-            optimizer.step()
             
-            total_loss += loss.item()
-            batch_count += 1
+            if scaler is not None:  # 혼합 정밀도 사용
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                
+                # 스케일링된 역전파
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+            
+            train_loss += loss.item() * inputs.size(0)
+            
+            if verbose > 0:
+                train_bar.set_postfix({'Loss': f"{loss.item():.4f}"})
         
-        avg_train_loss = total_loss / max(1, batch_count)
-        history['train_loss'].append(avg_train_loss)
+        # 에포크 종료 후 평균 손실 계산
+        train_loss = train_loss / len(train_loader.dataset)
+        train_losses.append(train_loss)
         
         # 검증
-        if validation_data:
-            model.eval()
-            with torch.no_grad():
-                val_outputs = model(X_val)
-                val_loss = criterion(val_outputs, Y_val).item()
-                history['val_loss'].append(val_loss)
-                
-                # 학습률 스케줄러 업데이트
-                scheduler.step(val_loss)
-                
-                # 조기 종료
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    best_model_state = model.state_dict().copy()
-                    counter = 0
-                else:
-                    counter += 1
-                    if counter >= patience:
-                        if verbose:
-                            print(f"Early stopping at epoch {epoch+1}")
-                        break
+        model.eval()
+        val_loss = 0
         
-        if verbose > 0 and (epoch+1) % max(1, epochs//10) == 0:
-            val_msg = f", Val Loss: {val_loss:.4f}" if validation_data else ""
-            print(f"Epoch [{epoch+1}/{epochs}], Train Loss: {avg_train_loss:.4f}{val_msg}")
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item() * inputs.size(0)
+        
+        val_loss = val_loss / len(val_loader.dataset)
+        val_losses.append(val_loss)
+        
+        # 진행 상황 출력
+        if verbose > 0 and (epoch+1) % (epochs//10 or 1) == 0:
+            print(f"Epoch [{epoch+1}/{epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        
+        # 최고 모델 저장 및 조기 종료 확인
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_state = model.state_dict().copy()
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+            
+        # 조기 종료
+        if no_improve_epochs >= patience:
+            if verbose > 0:
+                print(f"조기 종료: {epoch+1} 에폭에서 검증 손실 개선 없음")
+            break
     
-    # 조기 종료된 경우 최적 모델 복원
-    if best_model_state and validation_data:
+    # 최고 모델 복원
+    if best_model_state is not None:
         model.load_state_dict(best_model_state)
     
-    return model, history
+    return model, {'train_losses': train_losses, 'val_losses': val_losses}
 
 def train_model_with_cv(model_creator, X, Y, cv=5, epochs=100, batch_size=32, **train_kwargs):
     """

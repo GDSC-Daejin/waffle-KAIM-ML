@@ -26,3 +26,7 @@ var/
 # Virtual Environment
 venv/
 ENV/
+
+cache
+__pycache__
+logs

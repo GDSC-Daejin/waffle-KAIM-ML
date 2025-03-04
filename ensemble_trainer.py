@@ -240,8 +240,24 @@ class OilPriceEnsembleTrainer:
         
         return ensemble, errors
 
-    def train_region_models(self, epochs=100, batch_size=32, patience=10):
+    def train_region_models(self, epochs=100, batch_size=None, patience=10):
         """지역별 모델 학습"""
+        # GPU 최적화를 위한 배치 크기 자동 계산
+        if batch_size is None:
+            if self.use_gpu and torch.cuda.is_available():
+                # GPU 메모리 크기에 따라 최적의 배치 크기 선택
+                gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB 단위
+                if gpu_mem > 10:  # 고용량 GPU (예: RTX 3080 이상)
+                    batch_size = 256
+                elif gpu_mem > 7:  # 중간 용량 GPU (예: GTX 1080)
+                    batch_size = 128
+                else:  # 저용량 GPU
+                    batch_size = 64
+            else:
+                batch_size = 32  # CPU 기본값
+        
+        self.logger.info(f"학습에 사용할 배치 크기: {batch_size}")
+        
         if not self.is_region_data:
             self.logger.info("지역 정보가 없어 전체 데이터로 단일 모델 학습 중...")
             ensemble, _ = self.train_base_models(epochs, batch_size, patience)
@@ -483,7 +499,7 @@ class OilPriceEnsembleTrainer:
             return False
 
 def run_ensemble_prediction_pipeline(features_df, target_cols, look_back=3, future_steps=7, 
-                                    ensemble_size=3, use_gpu=True):
+                                     ensemble_size=3, use_gpu=True, batch_size=None):
     """
     앙상블 예측 파이프라인 실행
     
@@ -494,6 +510,7 @@ def run_ensemble_prediction_pipeline(features_df, target_cols, look_back=3, futu
         future_steps: 예측할 미래 일 수
         ensemble_size: 앙상블에 포함할 모델 수
         use_gpu: GPU 사용 여부
+        batch_size: 학습 배치 크기 (None이면 자동 설정)
     
     Returns:
         지역별 예측 결과
@@ -512,8 +529,8 @@ def run_ensemble_prediction_pipeline(features_df, target_cols, look_back=3, futu
         # 변수 중요도 분석
         importance_df = trainer.analyze_variable_importance()
         
-        # 지역별 모델 학습
-        trainer.train_region_models(epochs=100, batch_size=32, patience=10)
+        # 지역별 모델 학습 - batch_size 매개변수 전달
+        trainer.train_region_models(epochs=100, batch_size=batch_size, patience=10)
         
         # 학습된 모델 저장
         trainer.save_models()

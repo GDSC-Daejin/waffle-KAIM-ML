@@ -13,6 +13,7 @@ from data_loader import load_data_from_mongo
 from data_preprocessor import apply_feature_engineering
 from ensemble_trainer import OilPriceEnsembleTrainer, run_ensemble_prediction_pipeline
 from utils import get_optimal_device_config, cache_result, clear_cache
+from monitor import ResourceMonitor
 
 def setup_logging():
     """로깅 설정"""
@@ -116,7 +117,7 @@ def apply_engineering_to_df(df, target_cols):
     return enhanced_df
 
 @cache_result(expire_hours=24)
-def run_prediction_pipeline(df, target_cols, look_back=3, future_steps=7, ensemble_size=3, use_gpu=True):
+def run_prediction_pipeline(df, target_cols, look_back=3, future_steps=7, ensemble_size=3, use_gpu=True, batch_size=None):
     """예측 파이프라인 실행"""
     logger = logging.getLogger(__name__)
     logger.info("예측 파이프라인 시작...")
@@ -128,7 +129,8 @@ def run_prediction_pipeline(df, target_cols, look_back=3, future_steps=7, ensemb
         look_back=look_back,
         future_steps=future_steps,
         ensemble_size=ensemble_size,
-        use_gpu=use_gpu
+        use_gpu=use_gpu,
+        batch_size=batch_size  # 배치 크기 추가
     )
     
     logger.info(f"예측 완료. {len(predictions)}개 지역에 대한 예측 결과 생성됨")
@@ -166,6 +168,8 @@ def main():
                         help="GPU 사용 여부")
     parser.add_argument('--clear_cache', action='store_true', help="캐시 삭제 여부")
     parser.add_argument('--output', type=str, default="predictions.json", help="출력 파일명")
+    parser.add_argument('--batch_size', type=int, default=None, help="학습 배치 크기 (None: 자동 설정)")
+    parser.add_argument('--monitor_resources', action='store_true', help="시스템 리소스 모니터링 활성화")
     args = parser.parse_args()
     
     # 타겟 컬럼 환경 변수에서 가져오기
@@ -186,6 +190,13 @@ def main():
     logger.info(f"CPU 코어 수: {os.cpu_count()}")
     
     start_time = time.time()
+    
+    # 리소스 모니터링 시작 (선택 사항)
+    if args.monitor_resources:
+        monitor = ResourceMonitor(interval=1.0)
+        monitor.start()
+    else:
+        monitor = None
     
     # 데이터 로드
     try:
@@ -220,10 +231,14 @@ def main():
             look_back=args.look_back,
             future_steps=args.future_steps,
             ensemble_size=args.ensemble_size,
-            use_gpu=args.use_gpu
+            use_gpu=args.use_gpu,
+            batch_size=args.batch_size  # 배치 크기 추가
         )
     except Exception as e:
         logger.error(f"예측 실행 중 오류 발생: {str(e)}")
+        if monitor:
+            monitor.stop()
+            monitor.plot(save_path="error_resource_usage.png")
         return
     
     # 결과 출력
@@ -239,6 +254,12 @@ def main():
         export_predictions_to_json(predictions, args.output)
     except Exception as e:
         logger.error(f"결과 저장 중 오류 발생: {str(e)}")
+    
+    # 리소스 모니터링 종료 및 결과 저장
+    if monitor:
+        monitor.stop()
+        monitor.plot(save_path="resource_usage.png")
+        logger.info("리소스 사용량 그래프가 저장되었습니다.")
     
     total_time = time.time() - start_time
     logger.info(f"전체 실행 시간: {total_time:.2f}초")
