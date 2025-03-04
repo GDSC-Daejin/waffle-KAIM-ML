@@ -1,9 +1,0 @@
-pandas
-numpy
-torch
-scikit-learn
-matplotlib
-scipy
-mplcursors
-pymongo
-python-dotenv

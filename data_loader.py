@@ -3,6 +3,7 @@ import re
 from pymongo import MongoClient
 import datetime
 import os
+import logging
 from dotenv import load_dotenv
 
 # .env 파일 로드
@@ -18,6 +19,8 @@ def load_data_from_mongo():
     - 이 함수는 해당 형식의 컬렉션들을 찾아 각 컬렉션의 데이터를 DataFrame으로 변환한 후,
       이를 하나의 DataFrame으로 합쳐 반환합니다.
     """
+    logger = logging.getLogger(__name__)
+    
     # 환경 변수에서 DB 연결 정보 가져오기
     mongo_user = os.getenv("MONGO_USER")
     mongo_password = os.getenv("MONGO_PASSWORD")
@@ -25,6 +28,10 @@ def load_data_from_mongo():
     mongo_db = os.getenv("MONGO_DB", "kaim")
     mongo_connect_timeout = int(os.getenv("MONGO_CONNECT_TIMEOUT", "120000"))
     mongo_socket_timeout = int(os.getenv("MONGO_SOCKET_TIMEOUT", "120000"))
+    
+    # 환경 변수 확인
+    if not all([mongo_user, mongo_password, mongo_host]):
+        raise ValueError("필요한 MongoDB 환경 변수(MONGO_USER, MONGO_PASSWORD, MONGO_HOST)가 설정되지 않았습니다.")
     
     # 연결 문자열 구성
     connection_string = (

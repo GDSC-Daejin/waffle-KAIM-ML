@@ -1,262 +1,247 @@
+import os
 import torch
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
+import argparse
+import logging
+from datetime import datetime
+import json
+import time
+import multiprocessing as mp
+
 from data_loader import load_data_from_mongo
-from data_preprocessor import create_dataset, prepare_data
-from model import LSTMModel
-from train import train_model
-from visualize import plot_results
+from data_preprocessor import apply_feature_engineering
+from ensemble_trainer import OilPriceEnsembleTrainer, run_ensemble_prediction_pipeline
+from utils import get_optimal_device_config, cache_result, clear_cache
 
-def flatten(x):
-    if isinstance(x, list):
-        flat_list = []
-        for item in x:
-            flat_list.extend(flatten(item))
-        return flat_list
-    else:
-        return [x]
-
-def flatten_and_average(x):
-    if isinstance(x, list):
-        flat_list = flatten(x)
-        numeric_vals = []
-        for item in flat_list:
-            try:
-                numeric_vals.append(float(item))
-            except:
-                pass
-        return np.mean(numeric_vals) if numeric_vals else np.nan
-    else:
-        try:
-            return float(x)
-        except:
-            return np.nan
-
-def flatten_to_string(x):
-    if isinstance(x, list):
-        return ",".join(str(v) for v in flatten(x))
-    return str(x)
-
-def predict_future_exo(model, last_sequence, future_steps, target_scaler, target_start_index):
-    model.eval()
-    predictions = []
-    current_seq = last_sequence.copy()  # shape: (look_back, num_features)
-    date_index = 0  # 'date' 열을 0번째라고 가정
-    for _ in range(future_steps):
-        input_tensor = torch.FloatTensor(current_seq).unsqueeze(0)
-        with torch.no_grad():
-            pred = model(input_tensor).numpy()[0]
-        predictions.append(pred)
-        
-        # 슬라이딩 윈도우
-        new_row = current_seq[-1].copy()
-        new_row[date_index] += 1  # 날짜 ordinal 값 +1
-        new_row[target_start_index : target_start_index + len(pred)] = pred
-        new_row = new_row.reshape(1, -1)
-        current_seq = np.vstack([current_seq[1:], new_row])
-
-    predictions = np.array(predictions)
-    predictions = target_scaler.inverse_transform(predictions)
-    return predictions
-
-def predict_for_df(df_in, all_features, target_cols, look_back=3, future_steps=7, epochs=100):
-    df_in = df_in.sort_values('date').copy()
-
-    features = df_in[all_features].copy()
-
-    if 'date' in features.columns:
-        features['date'] = features['date'].apply(lambda x: x.toordinal() if pd.notnull(x) else np.nan)
-    if 'area' in features.columns:
-        # area를 숫자로 변환
-        features['area'] = pd.factorize(features['area'])[0]
-
-    for col in features.columns:
-        if col not in ['date','area']:
-            features[col] = features[col].apply(flatten_and_average)
-    for col in features.columns:
-        features[col] = pd.to_numeric(features[col], errors='coerce')
-
-    # 전부 NaN인 열/행 제거
-    features.dropna(axis=1, how='all', inplace=True)
-    features.dropna(axis=0, how='all', inplace=True)
-    if len(features) == 0:
-        print("[WARN] predict_for_df: after dropna, no data left.")
-        return pd.DataFrame()
-
-    # 스케일러
-    f_scaler = MinMaxScaler()
-    norm_feat = f_scaler.fit_transform(features.values)
-
-    # 타겟 스케일러
-    t_scaler = MinMaxScaler()
-    valid_tcols = [c for c in target_cols if c in df_in.columns]
-    if not valid_tcols:
-        print("[WARN] no valid target columns in df_in.")
-        return pd.DataFrame()
+def setup_logging():
+    """로깅 설정"""
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
     
-    tdata = df_in[valid_tcols].fillna(0).values
-    t_scaler.fit(tdata)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(f"{log_dir}/main_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
 
-    # 시계열 생성
-    X, Y_full = create_dataset(norm_feat, look_back)
-    if len(X) < 1:
-        print("[WARN] not enough data for look_back.")
-        return pd.DataFrame()
-    X, Y_full = prepare_data(X, Y_full)
-
-    # 타겟 인덱스
-    col_list = list(features.columns)
-    target_indices = []
-    for tc in valid_tcols:
-        if tc in col_list:
-            target_indices.append(col_list.index(tc))
-    if not target_indices:
-        print("[WARN] target indices empty.")
-        return pd.DataFrame()
-
-    Y_np = Y_full.numpy()
-    Y = Y_np[:, target_indices]
-
-    input_dim = X.shape[2]
-    hidden_dim = 50
-    layer_dim = 1
-    output_dim = len(target_indices)
-
-    model = LSTMModel(input_dim, hidden_dim, layer_dim, output_dim)
-    model = train_model(model, X, torch.FloatTensor(Y), epochs=epochs)
-
-    last_seq = norm_feat[-look_back:]
-    future_preds = predict_future_exo(model, last_seq, future_steps, t_scaler, min(target_indices))
-
-    # 날짜 생성
-    last_date = df_in['date'].iloc[-1]
-    if pd.isnull(last_date):
-        print("[WARN] last_date is NaN.")
-        return pd.DataFrame()
-
-    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=future_steps)
-    pred_df = pd.DataFrame(future_preds, columns=valid_tcols)
-    pred_df['date'] = future_dates
-
-    return pred_df
-
-def main():
-    df = load_data_from_mongo()
+def preprocess_data(df):
+    """데이터 전처리"""
+    logger = logging.getLogger(__name__)
+    logger.info("데이터 전처리 시작...")
     
+    # 날짜 처리
     df['date'] = df['date'].str.replace("Date_", "", regex=False)
     df['date'] = pd.to_datetime(df['date'], format="%Y_%m_%d", errors='coerce')
-    df.sort_values('date', inplace=True)
-
-    # 만약 area가 여러 지역을 쉼표로 묶어서 가지고 있다면, explode 시켜야 함
-    # 예: "National,Seoul,Busan" => ["National","Seoul","Busan"] => 3행
-    df['area'] = df['area'].fillna("Unknown").apply(flatten_to_string)
-    # explode를 위해 split
-    df['area'] = df['area'].apply(lambda x: x.split(',') if isinstance(x,str) and ',' in x else [x])
-    # explode
-    df = df.explode('area')
-    # strip해서 공백 제거
-    df['area'] = df['area'].apply(lambda x: x.strip() if isinstance(x,str) else x)
-
-    # 다른 컬럼 -> flatten_and_average
+    df = df.sort_values('date')
+    
+    # 지역 데이터 처리
+    if 'area' in df.columns:
+        # 리스트 형태의 area를 문자열로 변환
+        df['area'] = df['area'].apply(lambda x: ','.join(x) if isinstance(x, list) else x)
+        # 콤마로 구분된 지역을 별도 행으로 분리
+        df['area'] = df['area'].str.split(',')
+        df = df.explode('area')
+        # 공백 제거
+        df['area'] = df['area'].str.strip()
+    else:
+        df['area'] = 'National'
+    
+    # 리스트 형태의 값 변환 (평균값 계산)
     for col in df.columns:
-        if col not in ['date','area']:
-            df[col] = df[col].apply(flatten_and_average)
+        if col not in ['date', 'area']:
+            df[col] = df[col].apply(process_list_values)
+    
+    # 모든 컬럼을 숫자형으로 변환
+    for col in df.columns:
+        if col not in ['date', 'area']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
     # NaN 처리
-    df.dropna(axis=1, how='all', inplace=True)
-    df.dropna(axis=0, how='all', inplace=True)
+    df = df.dropna(axis=1, how='all')
+    df = df.dropna(axis=0, how='any', subset=[col for col in df.columns if col not in ['date', 'area']])
+    
+    # 중복 제거
+    df = df.drop_duplicates(['date', 'area'])
+    
+    logger.info(f"전처리 완료. 데이터 크기: {df.shape}")
+    return df
 
-    # 전체 피처
-    # 원하는 공통지표/유가/등등 실제 컬럼명 확인 후 맞춰야 함
-    all_features = df.columns.tolist()
-    # date, area를 맨 앞으로
-    if 'date' in all_features:
-        all_features.remove('date')
-        all_features.insert(0,'date')
-    if 'area' in all_features:
-        all_features.remove('area')
-        all_features.insert(1,'area')
+def process_list_values(x):
+    """리스트 형태의 값을 처리"""
+    try:
+        if isinstance(x, list):
+            # 빈 리스트 처리
+            if not x:
+                return np.nan
+                
+            # 중첩 리스트 평탄화
+            flat_values = []
+            
+            def flatten(items):
+                for item in items:
+                    if isinstance(item, list):
+                        flatten(item)
+                    else:
+                        try:
+                            flat_values.append(float(item))
+                        except (ValueError, TypeError):
+                            pass
+            
+            flatten(x)
+            
+            # 숫자값이 있으면 평균 반환, 없으면 NaN
+            if flat_values:
+                return np.mean(flat_values)
+            return np.nan
+        
+        # 숫자로 변환 시도
+        return float(x)
+    except (ValueError, TypeError):
+        return np.nan
 
-    # 예측할 타겟 (유가 4종이라고 가정)
-    target_cols = ['gasoline','premiumGasoline','diesel','kerosene']
+def apply_engineering_to_df(df, target_cols):
+    """특성 공학 적용"""
+    logger = logging.getLogger(__name__)
+    logger.info("특성 공학 적용 시작...")
+    
+    # 전체 데이터에 특성 공학 적용
+    enhanced_df = apply_feature_engineering(df, target_cols)
+    
+    logger.info(f"특성 공학 적용 완료. 특성 수: {len(enhanced_df.columns)}")
+    return enhanced_df
 
-    ##########################
-    # 1) 전국 평균 예측
-    ##########################
-    # date만으로 groupby -> 모든 숫자 평균
-    # as_index=False -> date컬럼 유지
-    nat_gb = df.groupby('date', as_index=False).mean(numeric_only=True)
-    nat_gb['area'] = 'National'
-    nat_pred = predict_for_df(nat_gb, all_features, target_cols, look_back=3, future_steps=7)
-    # (빈 df일 수도 있음)
+@cache_result(expire_hours=24)
+def run_prediction_pipeline(df, target_cols, look_back=3, future_steps=7, ensemble_size=3, use_gpu=True):
+    """예측 파이프라인 실행"""
+    logger = logging.getLogger(__name__)
+    logger.info("예측 파이프라인 시작...")
+    
+    # 앙상블 예측 실행
+    predictions = run_ensemble_prediction_pipeline(
+        df,
+        target_cols,
+        look_back=look_back,
+        future_steps=future_steps,
+        ensemble_size=ensemble_size,
+        use_gpu=use_gpu
+    )
+    
+    logger.info(f"예측 완료. {len(predictions)}개 지역에 대한 예측 결과 생성됨")
+    return predictions
 
-    ##########################
-    # 2) 지역별 예측
-    ##########################
-    # date+area로 groupby -> 평균
-    region_gb = df.groupby(['date','area'], as_index=False).mean(numeric_only=True)
-    # 이제 unique area들에 대해 예측
-    unique_areas = region_gb['area'].unique()
+def export_predictions_to_json(predictions, output_file):
+    """예측 결과를 JSON 파일로 저장"""
+    logger = logging.getLogger(__name__)
+    
+    # 데이터프레임을 JSON 직렬화 가능한 형태로 변환
+    json_data = {}
+    for region, pred_df in predictions.items():
+        json_data[region] = {}
+        for date, row in pred_df.iterrows():
+            date_str = date.strftime('%Y-%m-%d')
+            json_data[region][date_str] = row.to_dict()
+    
+    # JSON 파일 저장
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(json_data, f, ensure_ascii=False, indent=2)
+    
+    logger.info(f"예측 결과가 {output_file}에 저장되었습니다.")
 
-    region_preds_list = []
-    for reg in unique_areas:
-        if reg == 'National':
-            continue
-        sub_df = region_gb[region_gb['area'] == reg].copy()
-        while len(sub_df) < 3:
-            sub_df = pd.concat([sub_df, sub_df.iloc[[-1]]], ignore_index=True)
-        r_pred = predict_for_df(sub_df, all_features, target_cols, look_back=3, future_steps=7)
-        if not r_pred.empty:
-            r_pred['area'] = reg
-            region_preds_list.append(r_pred)
-
-    ##########################
-    # 3) 콘솔 출력
-    ##########################
-    print("\n=== 7일치 유가 예측 결과 ===\n")
-
-    # 전국 평균
-    print("[전국 평균 예측]\n")
-    if not nat_pred.empty:
-        print("지역: National")
-        for _, row in nat_pred.iterrows():
-            d = row['date']
-            date_str = d.strftime('%Y-%m-%d') if pd.notnull(d) else "Unknown"
-            print(f"{date_str}: gasoline={row.get('gasoline',np.nan):.2f}, "
-                  f"premiumGasoline={row.get('premiumGasoline',np.nan):.2f}, "
-                  f"diesel={row.get('diesel',np.nan):.2f}, "
-                  f"kerosene={row.get('kerosene',np.nan):.2f}")
-    else:
-        print("전국 평균 예측 데이터가 없습니다.\n")
-
-    # 지역별
-    print("\n[지역별 예측]\n")
-    if not region_preds_list:
-        print("지역별 예측 결과가 없습니다(데이터가 없거나 NaN).")
-    else:
-        for rp in region_preds_list:
-            region_name = rp['area'].iloc[0]
-            print(f"지역: {region_name}")
-            for _, row in rp.iterrows():
-                d = row['date']
-                date_str = d.strftime('%Y-%m-%d') if pd.notnull(d) else "Unknown"
-                print(f"{date_str}: gasoline={row.get('gasoline',np.nan):.2f}, "
-                      f"premiumGasoline={row.get('premiumGasoline',np.nan):.2f}, "
-                      f"diesel={row.get('diesel',np.nan):.2f}, "
-                      f"kerosene={row.get('kerosene',np.nan):.2f}")
-            print()
-
-    ##########################
-    # 4) 시각화
-    ##########################
-    # (전국 평균 기반)
-    if not nat_pred.empty:
-        # groupby된 nat_gb 가 실제값
-        actual_dates = nat_gb['date']
-        actual_data = nat_gb[target_cols].fillna(0).values
-        future_dates = nat_pred['date']
-        future_data = nat_pred[target_cols].fillna(0).values
-        plot_results(actual_dates, actual_data, future_dates, future_data)
+def main():
+    """메인 함수"""
+    # 명령행 인자 파싱
+    parser = argparse.ArgumentParser(description="유가 예측 시스템")
+    parser.add_argument('--look_back', type=int, default=int(os.getenv("LOOK_BACK", "3")),
+                        help="시계열 윈도우 크기")
+    parser.add_argument('--future_steps', type=int, default=int(os.getenv("FUTURE_STEPS", "7")),
+                        help="예측할 미래 일 수")
+    parser.add_argument('--ensemble_size', type=int, default=int(os.getenv("ENSEMBLE_SIZE", "3")),
+                        help="앙상블 모델 수")
+    parser.add_argument('--use_gpu', action='store_true', default=(os.getenv("USE_GPU", "true").lower() == "true"),
+                        help="GPU 사용 여부")
+    parser.add_argument('--clear_cache', action='store_true', help="캐시 삭제 여부")
+    parser.add_argument('--output', type=str, default="predictions.json", help="출력 파일명")
+    args = parser.parse_args()
+    
+    # 타겟 컬럼 환경 변수에서 가져오기
+    target_cols = os.getenv("TARGET_COLS", "gasoline,premiumGasoline,diesel,kerosene").split(",")
+    
+    # 로깅 설정
+    logger = setup_logging()
+    logger.info(f"유가 예측 시스템 시작, 인자: {args}")
+    
+    # 캐시 삭제 요청이 있으면 캐시 삭제
+    if args.clear_cache:
+        clear_cache()
+        logger.info("캐시가 삭제되었습니다.")
+    
+    # 하드웨어 환경 확인
+    device, use_mixed_precision, num_workers = get_optimal_device_config()
+    logger.info(f"디바이스: {device}, 혼합 정밀도: {use_mixed_precision}, 워커 수: {num_workers}")
+    logger.info(f"CPU 코어 수: {os.cpu_count()}")
+    
+    start_time = time.time()
+    
+    # 데이터 로드
+    try:
+        df = load_data_from_mongo()
+        if df.empty:
+            logger.error("데이터를 로드할 수 없습니다.")
+            return
+        logger.info(f"MongoDB에서 데이터 로드 완료. 크기: {df.shape}")
+    except Exception as e:
+        logger.error(f"데이터 로드 중 오류 발생: {str(e)}")
+        return
+    
+    # 데이터 전처리
+    try:
+        df = preprocess_data(df)
+    except Exception as e:
+        logger.error(f"데이터 전처리 중 오류 발생: {str(e)}")
+        return
+    
+    # 특성 공학 적용
+    try:
+        df = apply_engineering_to_df(df, target_cols)
+    except Exception as e:
+        logger.error(f"특성 공학 적용 중 오류 발생: {str(e)}")
+        return
+    
+    # 예측 실행
+    try:
+        predictions = run_prediction_pipeline(
+            df,
+            target_cols,
+            look_back=args.look_back,
+            future_steps=args.future_steps,
+            ensemble_size=args.ensemble_size,
+            use_gpu=args.use_gpu
+        )
+    except Exception as e:
+        logger.error(f"예측 실행 중 오류 발생: {str(e)}")
+        return
+    
+    # 결과 출력
+    logger.info("\n=== 예측 결과 요약 ===")
+    for region, pred_df in predictions.items():
+        logger.info(f"\n지역: {region}")
+        for date, row in pred_df.iterrows():
+            date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
+            logger.info(f"{date_str}: " + ", ".join([f"{col}={row[col]:.2f}" for col in target_cols]))
+    
+    # JSON 형식으로 저장
+    try:
+        export_predictions_to_json(predictions, args.output)
+    except Exception as e:
+        logger.error(f"결과 저장 중 오류 발생: {str(e)}")
+    
+    total_time = time.time() - start_time
+    logger.info(f"전체 실행 시간: {total_time:.2f}초")
 
 if __name__ == "__main__":
     main()

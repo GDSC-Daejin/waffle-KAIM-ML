@@ -1,0 +1,27 @@
+# 기본 데이터 분석 및 처리
+numpy>=1.19.0
+pandas>=1.1.0
+scikit-learn>=0.24.0
+
+# 딥러닝
+torch>=1.8.0
+shap>=0.39.0
+
+# 시각화
+matplotlib>=3.3.0
+seaborn>=0.11.0
+
+# 병렬 처리
+joblib>=1.0.0
+tqdm>=4.50.0
+
+# MongoDB 연결
+pymongo>=3.11.0
+python-dotenv>=0.15.0
+
+# 선택적 패키지 (필요한 경우)
+# ipywidgets>=7.6.0  # Jupyter 노트북에서 위젯 사용 시
+# ipython>=7.0.0     # IPython 기능 사용 시
+
+# 추가 유틸리티
+requests>=2.25.0
