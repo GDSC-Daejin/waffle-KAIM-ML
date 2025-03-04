@@ -1,52 +1,88 @@
 import pandas as pd
 import re
 from pymongo import MongoClient
+import datetime
+import os
+from dotenv import load_dotenv
+
+# .env 파일 로드
+load_dotenv()
 
 def load_data_from_mongo():
     """
     [원리 설명]
     - MongoDB 서버에 저장된 'kaim' 데이터베이스에서 데이터를 가져옵니다.
+    - 서버 타임아웃을 방지하기 위해 list_collection_names() 대신 
+      날짜 범위를 기반으로 컬렉션 이름을 직접 생성합니다.
     - 각 날짜별로 저장된 컬렉션의 이름은 "Date_YYYY_MM_DD" 형식을 따릅니다.
-      예를 들어, "Date_2025_01_23", "Date_2025_02_05" 등이 이에 해당합니다.
-    - 이 함수는 해당 형식의 모든 컬렉션을 찾아 각 컬렉션의 데이터를 DataFrame으로 변환한 후,
+    - 이 함수는 해당 형식의 컬렉션들을 찾아 각 컬렉션의 데이터를 DataFrame으로 변환한 후,
       이를 하나의 DataFrame으로 합쳐 반환합니다.
-    - 데이터베이스 연결은 하드코딩된 연결 문자열(아이디 'kaim_r', 호스트 '152.70.233.5')을 사용합니다.
-    
-    [주요 기능]
-    - MongoClient를 이용해 MongoDB에 연결합니다.
-    - 모든 컬렉션 이름을 가져와 정규표현식으로 "Date_YYYY_MM_DD" 패턴에 맞는 컬렉션만 선택합니다.
-    - 각 컬렉션의 데이터를 pandas DataFrame으로 변환하고, 불필요한 '_id' 컬럼은 제거합니다.
-    - 여러 DataFrame을 하나로 통합하여 반환합니다.
     """
+    # 환경 변수에서 DB 연결 정보 가져오기
+    mongo_user = os.getenv("MONGO_USER")
+    mongo_password = os.getenv("MONGO_PASSWORD")
+    mongo_host = os.getenv("MONGO_HOST")
+    mongo_db = os.getenv("MONGO_DB", "kaim")
+    mongo_connect_timeout = int(os.getenv("MONGO_CONNECT_TIMEOUT", "120000"))
+    mongo_socket_timeout = int(os.getenv("MONGO_SOCKET_TIMEOUT", "120000"))
+    
+    # 연결 문자열 구성
     connection_string = (
-        "mongodb://kaim_r:qwerty1234@152.70.233.5/kaim?"
-        "retryWrites=true&w=majority&connectTimeoutMS=120000&socketTimeoutMS=120000"
+        f"mongodb://{mongo_user}:{mongo_password}@{mongo_host}/{mongo_db}?"
+        f"retryWrites=true&w=majority&connectTimeoutMS={mongo_connect_timeout}&socketTimeoutMS={mongo_socket_timeout}"
     )
-    db_name = "kaim"
+    
     client = MongoClient(connection_string)
-    db = client[db_name]
+    db = client[mongo_db]
     
-    # 모든 컬렉션 이름 중 "Date_YYYY_MM_DD" 패턴에 맞는 컬렉션만 선택합니다.
-    all_collections = db.list_collection_names()
-    pattern = r"^Date_\d{4}_\d{2}_\d{2}"
-    selected_collections = [col for col in all_collections if re.match(pattern, col)]
+    # list_collection_names()를 사용하는 대신 날짜 범위로 컬렉션 이름 생성
+    print("날짜 범위로 컬렉션 이름 생성 중...")
     
+    # 최근 데이터를 가져오기 위한 날짜 범위 생성
+    end_date = datetime.datetime.now()
+    days_to_look_back = int(os.getenv("DAYS_TO_LOOK_BACK", "2200"))
+    start_date = end_date - datetime.timedelta(days=days_to_look_back)
+    
+    date_list = []
+    current_date = start_date
+    while current_date <= end_date:
+        date_str = current_date.strftime("Date_%Y_%m_%d")
+        date_list.append(date_str)
+        current_date += datetime.timedelta(days=1)
+    
+    # 생성된 날짜 컬렉션 이름 중 실제로 존재하는지 확인
     df_list = []
-    # 선택된 각 컬렉션의 데이터를 DataFrame으로 변환합니다.
-    for col_name in selected_collections:
-        collection = db[col_name]
-        data = list(collection.find())
-        temp_df = pd.DataFrame(data)
-        # MongoDB에서 자동 생성되는 '_id' 컬럼은 필요 없으므로 제거합니다.
-        if '_id' in temp_df.columns:
-            temp_df.drop('_id', axis=1, inplace=True)
-        df_list.append(temp_df)
+    collection_count = 0
+    
+    for col_name in date_list:
+        try:
+            collection = db[col_name]
+            # 해당 컬렉션이 존재하고 데이터가 있는지 확인
+            count = collection.count_documents({}, limit=1)
+            if count > 0:
+                collection_count += 1
+                data = list(collection.find())
+                temp_df = pd.DataFrame(data)
+                # MongoDB에서 자동 생성되는 '_id' 컬럼은 필요 없으므로 제거합니다.
+                if '_id' in temp_df.columns:
+                    temp_df.drop('_id', axis=1, inplace=True)
+                # 날짜 정보 추가
+                temp_df['date'] = col_name
+                df_list.append(temp_df)
+                print(f"컬렉션 {col_name}에서 {len(data)}개 데이터 로드됨")
+        except Exception as e:
+            print(f"컬렉션 {col_name} 처리 중 오류 발생: {str(e)}")
+            continue
+    
+    print(f"총 {collection_count}개 컬렉션에서 데이터를 로드했습니다.")
     
     # 여러 DataFrame을 하나로 합칩니다.
     if df_list:
         df = pd.concat(df_list, axis=0, ignore_index=True)
+        print(f"최종 데이터프레임 크기: {df.shape}")
     else:
         df = pd.DataFrame()
+        print("로드된 데이터가 없습니다.")
     
     return df
 
