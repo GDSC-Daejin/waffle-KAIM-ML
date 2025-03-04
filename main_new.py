@@ -133,3 +133,14 @@ plt.title('7-Day Gasoline Price Forecast')
 plt.legend()
 plt.grid()
 plt.show()
+
+from sklearn.preprocessing import MinMaxScaler
+
+# 지역명 컬럼 제외 (숫자형 데이터만 선택)
+numeric_cols = df.select_dtypes(include=["number"]).columns  # 숫자 데이터만 선택
+scaler = MinMaxScaler()
+df[numeric_cols] = scaler.fit_transform(df[numeric_cols])
+
+print("* 데이터 스케일링 완료!")
+
+
