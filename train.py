@@ -35,8 +35,8 @@ def train_model(model, X_train, Y_train, X_val=None, Y_val=None,
     
     model = model.to(device)
     
-    # 혼합 정밀도 연산 설정 (GPU 효율성 향상)
-    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
+    # 혼합 정밀도 연산 설정 (GPU 효율성 향상) - 경고 해결
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     
     # 옵티마이저 및 손실 함수 설정
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -55,14 +55,18 @@ def train_model(model, X_train, Y_train, X_val=None, Y_val=None,
     val_dataset = torch.utils.data.TensorDataset(X_val, Y_val)
     
     # DataLoader 설정 (병렬 처리 향상)
-    num_workers = min(8, os.cpu_count()) if device.type == 'cuda' else 0
+    num_workers = min(8, os.cpu_count()) if device.type == 'cuda' else min(4, os.cpu_count())
+    prefetch_factor = 2  # 데이터 프리페칭으로 병목 현상 감소
+    
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, 
-        num_workers=num_workers, pin_memory=True if device.type == 'cuda' else False
+        num_workers=num_workers, pin_memory=True if device.type == 'cuda' else False,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None
     )
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=batch_size*2, shuffle=False,
-        num_workers=num_workers, pin_memory=True if device.type == 'cuda' else False
+        num_workers=num_workers, pin_memory=True if device.type == 'cuda' else False,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None
     )
     
     # 조기 종료를 위한 변수
@@ -86,7 +90,7 @@ def train_model(model, X_train, Y_train, X_val=None, Y_val=None,
             optimizer.zero_grad()
             
             if scaler is not None:  # 혼합 정밀도 사용
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):  # 경고 해결
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
                 
@@ -177,9 +181,10 @@ def train_model_with_cv(model_creator, X, Y, cv=5, epochs=100, batch_size=32, **
             model, 
             X_train_fold, 
             Y_train_fold, 
+            X_val=X_val_fold,
+            Y_val=Y_val_fold,
             epochs=epochs, 
             batch_size=batch_size, 
-            validation_data=(X_val_fold, Y_val_fold),
             **train_kwargs
         )
         
@@ -261,7 +266,8 @@ def train_ensemble_models(model_configs, X_train, Y_train, ensemble_size=5, cpu_
                     model, 
                     X_train_sub, 
                     Y_train_sub, 
-                    validation_data=(X_val, Y_val),
+                    X_val=X_val,
+                    Y_val=Y_val,
                     **train_kwargs
                 )
                 
@@ -291,7 +297,8 @@ def train_ensemble_models(model_configs, X_train, Y_train, ensemble_size=5, cpu_
                 model, 
                 X_train_sub, 
                 Y_train_sub, 
-                validation_data=(X_val, Y_val),
+                X_val=X_val,
+                Y_val=Y_val,
                 **train_kwargs
             )
             

@@ -14,6 +14,7 @@ from data_preprocessor import apply_feature_engineering
 from ensemble_trainer import OilPriceEnsembleTrainer, run_ensemble_prediction_pipeline
 from utils import get_optimal_device_config, cache_result, clear_cache
 from monitor import ResourceMonitor
+from parallel_utils import accelerate_training
 
 def setup_logging():
     """로깅 설정"""
@@ -156,6 +157,9 @@ def export_predictions_to_json(predictions, output_file):
 
 def main():
     """메인 함수"""
+    # 학습 가속화 설정 적용
+    accelerate_training()
+    
     # 명령행 인자 파싱
     parser = argparse.ArgumentParser(description="유가 예측 시스템")
     parser.add_argument('--look_back', type=int, default=int(os.getenv("LOOK_BACK", "3")),
@@ -187,7 +191,7 @@ def main():
     # 하드웨어 환경 확인
     device, use_mixed_precision, num_workers = get_optimal_device_config()
     logger.info(f"디바이스: {device}, 혼합 정밀도: {use_mixed_precision}, 워커 수: {num_workers}")
-    logger.info(f"CPU 코어 수: {os.cpu_count()}")
+    logger.info(f"CPU 코어 수: {os.cpu_count()}, 활성화된 스레드: {torch.get_num_threads()}")
     
     start_time = time.time()
     

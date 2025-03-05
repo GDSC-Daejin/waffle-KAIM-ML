@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import pandas as pd
+import json
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from model import create_model, EnsembleModel
 from train import train_model, train_ensemble_models
@@ -11,6 +12,7 @@ import os
 import pickle
 import logging
 from datetime import datetime, timedelta
+from parallel_utils import optimize_gpu_tensor_ops
 
 class OilPriceEnsembleTrainer:
     """
@@ -108,7 +110,7 @@ class OilPriceEnsembleTrainer:
         fh.setLevel(logging.INFO)
         
         # 포맷 설정
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levellevel)s - %(message)s')
         ch.setFormatter(formatter)
         fh.setFormatter(formatter)
         
@@ -133,7 +135,7 @@ class OilPriceEnsembleTrainer:
             self.logger.info(f"발견된 지역: {self.regions}")
             self.is_region_data = True
             
-            # area 컬럼을 제거 (중요: 이 부분이 누락됨)
+            # area 컬럼을 제거
             features = features.drop(columns=['area'])
         else:
             self.regions = ['all']
@@ -245,19 +247,15 @@ class OilPriceEnsembleTrainer:
         # GPU 최적화를 위한 배치 크기 자동 계산
         if batch_size is None:
             if self.use_gpu and torch.cuda.is_available():
-                # GPU 메모리 크기에 따라 최적의 배치 크기 선택
-                gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB 단위
-                if gpu_mem > 10:  # 고용량 GPU (예: RTX 3080 이상)
-                    batch_size = 256
-                elif gpu_mem > 7:  # 중간 용량 GPU (예: GTX 1080)
-                    batch_size = 128
-                else:  # 저용량 GPU
-                    batch_size = 64
+                # 최적화된 배치 크기 계산
+                batch_size = optimize_gpu_tensor_ops(mixed_precision=self.use_mixed_precision)
             else:
-                batch_size = 32  # CPU 기본값
+                # CPU용 대용량 배치 (128GB RAM 활용)
+                batch_size = 1024  # 대용량 RAM 활용을 위해 큰 배치 사용
         
         self.logger.info(f"학습에 사용할 배치 크기: {batch_size}")
         
+        # 단일 데이터셋 처리
         if not self.is_region_data:
             self.logger.info("지역 정보가 없어 전체 데이터로 단일 모델 학습 중...")
             ensemble, _ = self.train_base_models(epochs, batch_size, patience)
@@ -265,9 +263,11 @@ class OilPriceEnsembleTrainer:
             self.target_scalers['all'] = self.scaler
             return
         
+        # 지역별 모델 학습
         self.logger.info(f"{len(self.regions)}개 지역에 대한 모델 학습 시작...")
         
         def train_for_region(region):
+            """한 지역에 대한 모델 학습"""
             # 지역별 데이터 필터링
             region_data = self.features_df[self.features_df['area'] == region].copy()
             
@@ -324,7 +324,7 @@ class OilPriceEnsembleTrainer:
             
             return EnsembleModel(models, weights), scaler
         
-        # 병렬 처리
+        # 병렬 처리 또는 순차 처리
         results = []
         for region in tqdm(self.regions, desc="지역별 모델 학습"):
             ensemble, scaler = train_for_region(region)
@@ -357,7 +357,7 @@ class OilPriceEnsembleTrainer:
                 if 'date' in region_data.columns:
                     region_data = region_data.drop(columns=['date'])
                 if 'area' in region_data.columns:
-                    region_data = region_data.drop(columns(['area']))
+                    region_data = region_data.drop(columns=['area'])
                 data_array = region_data.values.astype(float)
                 normalized_data, _ = normalize_data(data_array)
             else:
@@ -498,8 +498,9 @@ class OilPriceEnsembleTrainer:
             self.logger.warning("로드할 모델이 없습니다.")
             return False
 
+
 def run_ensemble_prediction_pipeline(features_df, target_cols, look_back=3, future_steps=7, 
-                                     ensemble_size=3, use_gpu=True, batch_size=None):
+                                     ensemble_size=3, use_gpu=True, batch_size=None, num_workers=None):
     """
     앙상블 예측 파이프라인 실행
     
@@ -511,10 +512,15 @@ def run_ensemble_prediction_pipeline(features_df, target_cols, look_back=3, futu
         ensemble_size: 앙상블에 포함할 모델 수
         use_gpu: GPU 사용 여부
         batch_size: 학습 배치 크기 (None이면 자동 설정)
+        num_workers: 데이터 로딩 작업자 수 (None이면 자동 설정)
     
     Returns:
         지역별 예측 결과
     """
+    # 최적의 병렬 처리 설정 적용
+    if num_workers is None:
+        num_workers = min(16, os.cpu_count())  # 128GB RAM 활용을 위한 worker 수 증가
+    
     # 앙상블 트레이너 초기화
     trainer = OilPriceEnsembleTrainer(
         features_df=features_df,
