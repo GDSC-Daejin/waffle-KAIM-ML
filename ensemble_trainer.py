@@ -351,79 +351,124 @@ class OilPriceEnsembleTrainer:
         for region, model in self.region_models.items():
             self.logger.info(f"지역 {region}에 대한 예측 수행 중...")
             
-            # 마지막 시퀀스 데이터 가져오기
-            if self.is_region_data:
-                region_data = self.features_df[self.features_df['area'] == region].copy()
-                if 'date' in region_data.columns:
-                    region_data = region_data.drop(columns=['date'])
-                if 'area' in region_data.columns:
-                    region_data = region_data.drop(columns=['area'])
-                data_array = region_data.values.astype(float)
-                normalized_data, _ = normalize_data(data_array)
-            else:
-                normalized_data = self.normalized_data
-            
-            # 마지막 시퀀스
-            last_sequence = normalized_data[-self.look_back:]
-            
-            # 예측 수행
-            scaler = self.target_scalers[region]
-            current_sequence = last_sequence.copy()
-            region_predictions = []
-            
-            for _ in range(future_steps):
-                # 현재 시퀀스에서 예측
-                input_tensor = torch.FloatTensor(current_sequence).unsqueeze(0)
-                pred = model.predict(input_tensor)[0]
-                region_predictions.append(pred)
+            try:
+                # 일관된 디바이스 전략 - CPU에서 예측 수행
+                device = torch.device('cpu')
                 
-                # 시퀀스 업데이트: 마지막 항목 제거하고 예측값 추가
-                new_row = np.zeros((1, current_sequence.shape[1]))
+                # 모든 서브모델을 CPU로 이동
+                model = model.to(device)
+                
+                # 마지막 시퀀스 데이터 가져오기
                 if self.is_region_data:
-                    target_indices = [region_data.columns.tolist().index(col) for col in self.target_names if col in region_data.columns]
-                    for i, target_idx in enumerate(target_indices):
-                        new_row[0, target_idx] = pred[i]
+                    region_data = self.features_df[self.features_df['area'] == region].copy()
+                    if 'date' in region_data.columns:
+                        region_data = region_data.drop(columns=['date'])
+                    if 'area' in region_data.columns:
+                        region_data = region_data.drop(columns=['area'])
+                    data_array = region_data.values.astype(float)
+                    normalized_data, _ = normalize_data(data_array)
                 else:
-                    for i, target_idx in enumerate(self.target_indices):
-                        new_row[0, target_idx] = pred[i]
+                    normalized_data = self.normalized_data
                 
-                current_sequence = np.vstack([current_sequence[1:], new_row])
-            
-            # 예측 결과를 원래 스케일로 역변환
-            if self.is_region_data:
-                # 수정: 역변환 과정에서 인덱스 오류 가능성 확인
-                try:
-                    target_indices = [region_data.columns.tolist().index(col) for col in self.target_names if col in region_data.columns]
-                    original_scale_preds = np.zeros((future_steps, len(target_indices)))
+                # 마지막 시퀀스
+                last_sequence = normalized_data[-self.look_back:]
+                
+                # 예측 수행
+                scaler = self.target_scalers[region]
+                current_sequence = last_sequence.copy()
+                region_predictions = []
+                
+                for step in range(future_steps):
+                    # 현재 시퀀스에서 예측 - input_tensor는 CPU에 생성
+                    input_tensor = torch.FloatTensor(current_sequence).unsqueeze(0).to(device)
+                    
+                    # predict 메서드 수정: 인덱싱 대신 직접 예측값을 사용
+                    with torch.no_grad():
+                        pred_result = model.predict(input_tensor)
+                        
+                        # 배치 차원이 있는지 확인하고 필요하면 추출
+                        if hasattr(pred_result, 'shape') and len(pred_result.shape) > 1 and pred_result.shape[0] == 1:
+                            pred = pred_result[0]  # 배치 차원 제거
+                        else:
+                            pred = pred_result  # 배치 차원이 이미 없으면 그대로 사용
+                        
+                        # 로그로 형태 출력    
+                        self.logger.debug(f"예측 형태: {np.shape(pred)}")
+                    
+                    region_predictions.append(pred)
+                    
+                    # 시퀀스 업데이트: 마지막 항목 제거하고 예측값 추가
+                    new_row = np.zeros((1, current_sequence.shape[1]))
+                    if self.is_region_data:
+                        target_indices = [region_data.columns.tolist().index(col) for col in self.target_names if col in region_data.columns]
+                        
+                        # 예측값의 형태 확인 및 조정
+                        if isinstance(pred, np.ndarray) and pred.shape[0] == len(target_indices):
+                            # pred가 [n_targets] 형태인 경우
+                            for i, target_idx in enumerate(target_indices):
+                                if i < len(pred):
+                                    new_row[0, target_idx] = pred[i]
+                        else:
+                            # pred가 스칼라 또는 다른 형태인 경우
+                            for i, target_idx in enumerate(target_indices):
+                                if i < 4:  # 최대 4개 타겟 처리
+                                    try:
+                                        new_row[0, target_idx] = float(pred[i] if isinstance(pred, (list, np.ndarray)) else pred)
+                                    except (IndexError, TypeError):
+                                        self.logger.warning(f"인덱스 {i}의 예측값 추출 실패, 0으로 대체")
+                                        new_row[0, target_idx] = 0.0
+                    else:
+                        for i, target_idx in enumerate(self.target_indices):
+                            if isinstance(pred, np.ndarray) and i < len(pred):
+                                new_row[0, target_idx] = pred[i]
+                            else:
+                                try:
+                                    new_row[0, target_idx] = float(pred[i] if isinstance(pred, (list, np.ndarray)) else pred)
+                                except (IndexError, TypeError):
+                                    new_row[0, target_idx] = 0.0
+                    
+                    current_sequence = np.vstack([current_sequence[1:], new_row])
+                
+                # 예측 결과를 원래 스케일로 역변환
+                if self.is_region_data:
+                    try:
+                        target_indices = [region_data.columns.tolist().index(col) for col in self.target_names if col in region_data.columns]
+                        original_scale_preds = np.zeros((future_steps, len(target_indices)))
+                        for i in range(future_steps):
+                            temp = np.zeros((1, normalized_data.shape[1]))
+                            for j, target_idx in enumerate(target_indices):
+                                if j < len(region_predictions[i]):
+                                    temp[0, target_idx] = region_predictions[i][j]
+                            temp = scaler.inverse_transform(temp)
+                            for j, target_idx in enumerate(target_indices):
+                                original_scale_preds[i, j] = temp[0, target_idx]
+                    except Exception as e:
+                        self.logger.error(f"지역 {region} 예측 역변환 중 오류: {str(e)}")
+                        continue
+                else:
+                    original_scale_preds = np.zeros((future_steps, len(self.target_indices)))
                     for i in range(future_steps):
-                        temp = np.zeros((1, normalized_data.shape[1]))
-                        for j, target_idx in enumerate(target_indices):
-                            if j < len(region_predictions[i]):
-                                temp[0, target_idx] = region_predictions[i][j]
+                        temp = np.zeros((1, self.normalized_data.shape[1]))
+                        for j, target_idx in enumerate(self.target_indices):
+                            temp[0, target_idx] = region_predictions[i][j]
                         temp = scaler.inverse_transform(temp)
-                        for j, target_idx in enumerate(target_indices):
+                        for j, target_idx in enumerate(self.target_indices):
                             original_scale_preds[i, j] = temp[0, target_idx]
-                except Exception as e:
-                    self.logger.error(f"지역 {region} 예측 역변환 중 오류: {str(e)}")
-                    continue
-            else:
-                original_scale_preds = np.zeros((future_steps, len(self.target_indices)))
-                for i in range(future_steps):
-                    temp = np.zeros((1, self.normalized_data.shape[1]))
-                    for j, target_idx in enumerate(self.target_indices):
-                        temp[0, target_idx] = region_predictions[i][j]
-                    temp = scaler.inverse_transform(temp)
-                    for j, target_idx in enumerate(self.target_indices):
-                        original_scale_preds[i, j] = temp[0, target_idx]
-            
-            # 데이터프레임 생성
-            pred_df = pd.DataFrame(
-                original_scale_preds,
-                columns=self.target_names,
-                index=future_dates
-            )
-            
-            predictions[region] = pred_df
+                
+                # 데이터프레임 생성
+                pred_df = pd.DataFrame(
+                    original_scale_preds,
+                    columns=self.target_names,
+                    index=future_dates
+                )
+                
+                predictions[region] = pred_df
+                self.logger.info(f"지역 {region} 예측 완료")
+                
+            except Exception as e:
+                self.logger.error(f"지역 {region} 예측 중 오류 발생: {str(e)}")
+                import traceback
+                self.logger.error(traceback.format_exc())
         
         return predictions
 

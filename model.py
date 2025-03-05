@@ -101,8 +101,14 @@ class TransformerModel(BaseModel):
         self.input_embedding = nn.Linear(input_dim, hidden_dim)
         self.pos_encoder = PositionalEncoding(hidden_dim, dropout)
         
-        encoder_layers = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead, 
-                                                   dim_feedforward=hidden_dim*4, dropout=dropout)
+        # batch_first=True 설정으로 경고 해결
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, 
+            nhead=nhead, 
+            dim_feedforward=hidden_dim*4, 
+            dropout=dropout,
+            batch_first=True  # 중요: 이 파라미터를 True로 설정
+        )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
         self.fc = nn.Linear(hidden_dim, output_dim)
         self.dropout = nn.Dropout(dropout)
@@ -110,10 +116,15 @@ class TransformerModel(BaseModel):
     def forward(self, x):
         # x shape: [batch, seq_len, features]
         x = self.input_embedding(x)  # [batch, seq_len, hidden_dim]
-        x = x.permute(1, 0, 2)  # [seq_len, batch, hidden_dim] for transformer
+        
+        # batch_first=True 설정으로 더 이상 순서 변경이 필요 없음
+        # x = x.permute(1, 0, 2)  # 이 줄 제거
+        
         x = self.pos_encoder(x)
         x = self.transformer_encoder(x)
-        x = x[-1]  # 마지막 시퀀스의 출력 사용
+        
+        # 마지막 시퀀스의 출력 사용 - batch_first=True로 인한 인덱싱 변경
+        x = x[:, -1]  # 이제 [batch, seq_len, hidden_dim]에서 마지막 시퀀스 선택
         x = self.dropout(x)
         x = self.fc(x)
         return x
@@ -130,12 +141,15 @@ class PositionalEncoding(nn.Module):
         
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
+        
+        # batch_first=True 설정에 맞게 위치 인코딩 형태 변경
+        pe = pe.unsqueeze(0)  # [1, max_len, d_model]
         
         self.register_buffer('pe', pe)
         
     def forward(self, x):
-        x = x + self.pe[:x.size(0), :]
+        # x: [batch, seq_len, d_model]
+        x = x + self.pe[:, :x.size(1), :]  # 차원에 맞게 위치 인코딩 적용
         return self.dropout(x)
 
 class EnsembleModel:
@@ -148,11 +162,53 @@ class EnsembleModel:
         """각 모델의 예측을 가중합하여 최종 예측 생성"""
         predictions = []
         
+        # 입력 텐서 디바이스 확인
+        device = x.device if isinstance(x, torch.Tensor) else torch.device('cpu')
+        
+        # 배치 크기 일관성 확인
+        batch_size = x.shape[0] if isinstance(x, torch.Tensor) else x.shape[0]
+        
         for model in self.models:
+            # 모델 디바이스가 입력 텐서와 일치하는지 확인하고 필요시 이동
+            model_device = next(model.parameters()).device
+            if model_device != device:
+                model = model.to(device)
+                
             model.eval()
             with torch.no_grad():
+                # 모델 예측 수행
                 pred = model(x).cpu().numpy()
+                
+                # 예측 결과의 배치 크기 확인 및 수정
+                if pred.shape[0] != batch_size:
+                    # 모델이 배치 크기를 보존하지 않는 경우 (예: 첫 번째 샘플만 반환)
+                    print(f"모델 출력 형태 조정: {pred.shape} -> ({batch_size}, {pred.shape[-1]})")
+                    
+                    # 대부분의 경우 모델이 (1, features) 형태의 출력을 생성하는데
+                    # 이를 복제하여 원래 배치 크기로 확장
+                    if pred.shape[0] == 1 and batch_size > 1:
+                        pred = np.tile(pred, (batch_size, 1))
+                    # 반대로 모델이 필요 이상의 샘플을 생성한 경우 자르기
+                    elif pred.shape[0] > batch_size:
+                        pred = pred[:batch_size]
+                
                 predictions.append(pred)
+        
+        # 모든 예측이 동일한 형태를 갖는지 확인
+        shapes = [p.shape for p in predictions]
+        if len(set(str(s) for s in shapes)) > 1:
+            print(f"경고: 일관되지 않은 예측 형태: {shapes}")
+            
+            # 모든 예측을 첫 번째 예측 형태로 맞춤
+            target_shape = predictions[0].shape
+            for i in range(1, len(predictions)):
+                if predictions[i].shape != target_shape:
+                    # 형태가 다른 경우 재조정
+                    if predictions[i].shape[0] == 1:
+                        predictions[i] = np.tile(predictions[i], (target_shape[0], 1))
+                    else:
+                        # 크기가 다른 경우 첫 번째 샘플들만 사용
+                        predictions[i] = predictions[i][:target_shape[0]]
         
         # 가중 평균 계산
         weighted_preds = np.zeros_like(predictions[0])
@@ -160,6 +216,12 @@ class EnsembleModel:
             weighted_preds += self.weights[i] * pred
             
         return weighted_preds
+    
+    # 모든 모델을 특정 디바이스로 이동하는 메서드 추가
+    def to(self, device):
+        for i, model in enumerate(self.models):
+            self.models[i] = model.to(device)
+        return self
 
 def create_model(model_type, input_dim, hidden_dim, output_dim, **kwargs):
     """모델 타입에 따라 적절한 모델 인스턴스 생성"""

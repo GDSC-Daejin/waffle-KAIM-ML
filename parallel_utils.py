@@ -180,11 +180,20 @@ def optimize_gpu_tensor_ops(batch_size=None, mixed_precision=True):
     if not torch.cuda.is_available():
         return 32  # CPU 기본값
     
+    try:
+        # CUDA 컨텍스트 초기화 확인
+        dummy_tensor = torch.zeros(1, device='cuda')
+        del dummy_tensor
+    except RuntimeError as e:
+        print(f"CUDA 초기화 오류 발생: {e}")
+        print("CPU 모드로 전환합니다.")
+        return 32  # CPU 기본값
+    
     # GPU 메모리 크기에 따른 최적의 배치 크기 계산
     gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     
     if batch_size is None:
-        # 7.92GB GTX 1080 메모리에 최적화된 배치 크기 계산
+        # GPU 메모리에 최적화된 배치 크기 계산
         if mixed_precision:
             # FP16/FP32 혼합 정밀도 사용 시
             batch_size = int(min(512, 32 * (gpu_mem_gb / 4)))
@@ -223,3 +232,56 @@ def distribute_model_across_gpus(model, gpu_ids=None):
     
     # DistributedDataParallel보다 간단한 DataParallel 사용
     return torch.nn.DataParallel(model, device_ids=gpu_ids)
+
+def setup_cuda_multiprocessing():
+    """
+    CUDA와 멀티프로세싱 환경을 설정하여 호환성 문제 해결
+    
+    이 함수는 CUDA와 Python 멀티프로세싱을 함께 사용할 때 발생하는
+    초기화 문제를 해결하는 데 도움이 됩니다.
+    """
+    # 멀티프로세싱 시작 방법을 'spawn'으로 설정 (가장 안전한 방법)
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # 이미 설정되어 있을 경우 무시
+        pass
+    
+    # CUDA 초기화를 강제로 수행
+    if torch.cuda.is_available():
+        # 모든 CUDA 장치 초기화
+        for i in range(torch.cuda.device_count()):
+            torch.cuda.set_device(i)
+            torch.tensor([0], device=f'cuda:{i}')  # 각 장치에서 간단한 텐서 생성
+        
+        # 메모리 캐시 비우기
+        torch.cuda.empty_cache()
+        
+        print("CUDA 멀티프로세싱 환경이 설정되었습니다.")
+        return True
+    return False
+
+def get_optimal_worker_count(use_gpu=True):
+    """
+    시스템에 최적화된 DataLoader 워커 수 결정
+    
+    Args:
+        use_gpu: GPU를 사용할지 여부
+        
+    Returns:
+        최적의 워커 수
+    """
+    if not use_gpu or not torch.cuda.is_available():
+        # CPU 모드에서는 코어의 75% 정도 사용 (최소 1개)
+        return max(1, int(os.cpu_count() * 0.75)) if os.cpu_count() else 2
+    else:
+        # GPU 모드에서는 워커 수를 제한하여 CUDA 초기화 문제 방지
+        # GPU 별 워커 수 제한
+        workers_per_gpu = 2
+        num_gpus = torch.cuda.device_count()
+        
+        # CPU 코어 수와 GPU 기반 권장 워커 수 중 작은 값 선택
+        recommended = min(workers_per_gpu * num_gpus, os.cpu_count() or 4)
+        
+        # 최소 워커 수는 0 (메인 프로세스에서만 로딩)
+        return max(0, recommended - 1)  # 메인 프로세스를 위해 1 감소

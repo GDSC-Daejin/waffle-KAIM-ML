@@ -15,6 +15,7 @@ from ensemble_trainer import OilPriceEnsembleTrainer, run_ensemble_prediction_pi
 from utils import get_optimal_device_config, cache_result, clear_cache
 from monitor import ResourceMonitor
 from parallel_utils import accelerate_training
+from utils import performance_tracker, log_execution_time
 
 def setup_logging():
     """로깅 설정"""
@@ -157,8 +158,20 @@ def export_predictions_to_json(predictions, output_file):
 
 def main():
     """메인 함수"""
+    # CUDA와 멀티프로세싱 호환성 설정 추가
+    from parallel_utils import setup_cuda_multiprocessing
+    setup_cuda_multiprocessing()
+    
     # 학습 가속화 설정 적용
     accelerate_training()
+    
+    # 성능 추적 시작
+    performance_tracker.add_checkpoint("main_start")
+    
+    # 성능 로깅 설정
+    from logging_utils import get_performance_logger
+    perf_logger = get_performance_logger()
+    perf_logger.log_hardware_info()
     
     # 명령행 인자 파싱
     parser = argparse.ArgumentParser(description="유가 예측 시스템")
@@ -204,7 +217,10 @@ def main():
     
     # 데이터 로드
     try:
+        performance_tracker.add_checkpoint("data_loading_start")
         df = load_data_from_mongo()
+        performance_tracker.add_checkpoint("data_loading_end")
+        
         if df.empty:
             logger.error("데이터를 로드할 수 없습니다.")
             return
@@ -215,20 +231,25 @@ def main():
     
     # 데이터 전처리
     try:
+        performance_tracker.add_checkpoint("preprocessing_start")
         df = preprocess_data(df)
+        performance_tracker.add_checkpoint("preprocessing_end")
     except Exception as e:
         logger.error(f"데이터 전처리 중 오류 발생: {str(e)}")
         return
     
     # 특성 공학 적용
     try:
+        performance_tracker.add_checkpoint("feature_engineering_start")
         df = apply_engineering_to_df(df, target_cols)
+        performance_tracker.add_checkpoint("feature_engineering_end")
     except Exception as e:
         logger.error(f"특성 공학 적용 중 오류 발생: {str(e)}")
         return
     
     # 예측 실행
     try:
+        performance_tracker.add_checkpoint("prediction_start")
         predictions = run_prediction_pipeline(
             df,
             target_cols,
@@ -238,6 +259,7 @@ def main():
             use_gpu=args.use_gpu,
             batch_size=args.batch_size  # 배치 크기 추가
         )
+        performance_tracker.add_checkpoint("prediction_end")
     except Exception as e:
         logger.error(f"예측 실행 중 오류 발생: {str(e)}")
         if monitor:
@@ -264,6 +286,13 @@ def main():
         monitor.stop()
         monitor.plot(save_path="resource_usage.png")
         logger.info("리소스 사용량 그래프가 저장되었습니다.")
+    
+    # 성능 요약 로그 출력
+    performance_tracker.add_checkpoint("main_end")
+    performance_tracker.log_summary(logger)
+    
+    # 리소스 사용량 그래프 저장
+    performance_tracker.plot_resource_usage(save_path="performance_report.png")
     
     total_time = time.time() - start_time
     logger.info(f"전체 실행 시간: {total_time:.2f}초")

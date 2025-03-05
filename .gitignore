@@ -30,3 +30,4 @@ ENV/
 cache
 __pycache__
 logs
+model_cache

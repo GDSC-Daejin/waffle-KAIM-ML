@@ -9,6 +9,12 @@ from joblib import Parallel, delayed
 import torch
 import torch.multiprocessing as mp
 from tqdm import tqdm
+import logging
+import psutil
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+import json
+import platform
 
 # 캐싱 디렉토리
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cache')
@@ -331,3 +337,205 @@ def move_tensors_to_device(tensors, device):
         return tensors.to(device)
     else:
         return tensors
+
+class PerformanceTracker:
+    """성능 추적 클래스"""
+    
+    def __init__(self):
+        self.start_time = time.time()
+        self.checkpoints = {}
+        self.memory_usage = []
+        self.cpu_usage = []
+        self.gpu_usage = []
+        self.time_stamps = []
+        self.operation_counts = {}
+        
+        # 초기 시스템 정보 저장
+        self.system_info = {
+            'cpu_count': os.cpu_count(),
+            'platform': platform.platform(),
+            'python_version': platform.python_version(),
+            'torch_version': torch.__version__,
+            'cuda_available': torch.cuda.is_available(),
+            'cuda_version': torch.version.cuda if torch.cuda.is_available() else 'N/A',
+            'gpu_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        }
+        
+        if torch.cuda.is_available():
+            self.system_info['gpu_names'] = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+            
+    def add_checkpoint(self, name):
+        """체크포인트 추가"""
+        self.checkpoints[name] = time.time()
+        
+        # 시스템 리소스 사용량 추적
+        self.time_stamps.append(time.time() - self.start_time)
+        self.cpu_usage.append(psutil.cpu_percent())
+        self.memory_usage.append(psutil.virtual_memory().percent)
+        
+        if torch.cuda.is_available():
+            gpu_mem = []
+            for i in range(torch.cuda.device_count()):
+                gpu_mem.append(torch.cuda.memory_allocated(i) / (1024**3))  # GB
+            self.gpu_usage.append(gpu_mem)
+    
+    def log_operation(self, operation_name):
+        """연산 카운트"""
+        if operation_name not in self.operation_counts:
+            self.operation_counts[operation_name] = 0
+        self.operation_counts[operation_name] += 1
+    
+    def get_elapsed_time(self, checkpoint_name=None):
+        """특정 체크포인트부터 또는 시작부터 경과 시간 반환"""
+        if checkpoint_name:
+            if checkpoint_name not in self.checkpoints:
+                return 0
+            return time.time() - self.checkpoints[checkpoint_name]
+        return time.time() - self.start_time
+    
+    def get_summary(self):
+        """성능 요약 반환"""
+        elapsed = time.time() - self.start_time
+        
+        summary = {
+            'total_elapsed_time': elapsed,
+            'checkpoints': {},
+            'system_info': self.system_info,
+            'average_cpu_usage': np.mean(self.cpu_usage) if self.cpu_usage else 0,
+            'average_memory_usage': np.mean(self.memory_usage) if self.memory_usage else 0,
+            'operation_counts': self.operation_counts
+        }
+        
+        # 체크포인트간 시간 계산
+        checkpoints = list(sorted(self.checkpoints.items(), key=lambda x: x[1]))
+        for i in range(1, len(checkpoints)):
+            prev_name, prev_time = checkpoints[i-1]
+            curr_name, curr_time = checkpoints[i]
+            summary['checkpoints'][f"{prev_name}_to_{curr_name}"] = curr_time - prev_time
+        
+        # GPU 사용량 평균 추가
+        if self.gpu_usage:
+            summary['average_gpu_usage'] = {}
+            for i in range(len(self.gpu_usage[0])):
+                gpu_usage_i = [usage[i] for usage in self.gpu_usage]
+                summary['average_gpu_usage'][f'gpu_{i}'] = np.mean(gpu_usage_i)
+                
+        return summary
+    
+    def log_summary(self, logger=None):
+        """성능 요약 로깅"""
+        if logger is None:
+            logger = logging.getLogger()
+            
+        summary = self.get_summary()
+        
+        logger.info("=" * 50)
+        logger.info("성능 추적 요약")
+        logger.info(f"총 실행 시간: {summary['total_elapsed_time']:.2f} 초")
+        
+        logger.info("-" * 30)
+        logger.info("체크포인트 간 소요 시간:")
+        for segment, time_taken in summary['checkpoints'].items():
+            logger.info(f"  {segment}: {time_taken:.2f} 초")
+        
+        logger.info("-" * 30)
+        logger.info(f"평균 CPU 사용률: {summary['average_cpu_usage']:.1f}%")
+        logger.info(f"평균 메모리 사용률: {summary['average_memory_usage']:.1f}%")
+        
+        if 'average_gpu_usage' in summary:
+            logger.info("-" * 30)
+            logger.info("평균 GPU 메모리 사용량:")
+            for gpu, usage in summary['average_gpu_usage'].items():
+                logger.info(f"  {gpu}: {usage:.2f} GB")
+        
+        if summary['operation_counts']:
+            logger.info("-" * 30)
+            logger.info("연산 카운트:")
+            for op, count in summary['operation_counts'].items():
+                logger.info(f"  {op}: {count} 회")
+        
+        logger.info("=" * 50)
+    
+    def plot_resource_usage(self, save_path=None):
+        """리소스 사용량 그래프 생성"""
+        if not self.time_stamps:
+            return
+            
+        fig, ax = plt.subplots(2, 1, figsize=(10, 12))
+        
+        # CPU와 메모리 사용량
+        ax[0].plot(self.time_stamps, self.cpu_usage, 'b-', label='CPU Usage (%)')
+        ax[0].plot(self.time_stamps, self.memory_usage, 'r-', label='Memory Usage (%)')
+        ax[0].set_title('CPU and Memory Usage Over Time')
+        ax[0].set_xlabel('Time (seconds)')
+        ax[0].set_ylabel('Usage (%)')
+        ax[0].grid(True)
+        ax[0].legend()
+        
+        # GPU 사용량 (있는 경우)
+        if self.gpu_usage:
+            gpu_count = len(self.gpu_usage[0])
+            for i in range(gpu_count):
+                gpu_usage_i = [usage[i] for usage in self.gpu_usage]
+                ax[1].plot(self.time_stamps, gpu_usage_i, label=f'GPU {i} Memory (GB)')
+            ax[1].set_title('GPU Memory Usage Over Time')
+            ax[1].set_xlabel('Time (seconds)')
+            ax[1].set_ylabel('GPU Memory (GB)')
+            ax[1].grid(True)
+            ax[1].legend()
+        else:
+            ax[1].text(0.5, 0.5, 'No GPU Usage Data Available', 
+                      horizontalalignment='center', verticalalignment='center',
+                      transform=ax[1].transAxes)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path)
+        else:
+            plt.show()
+        
+        plt.close()
+
+# 글로벌 성능 추적 객체
+performance_tracker = PerformanceTracker()
+
+def track_performance(operation_name=None):
+    """함수 실행 성능을 추적하는 데코레이터"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            checkpoint_name = f"{operation_name or func.__name__}_start"
+            performance_tracker.add_checkpoint(checkpoint_name)
+            
+            result = func(*args, **kwargs)
+            
+            checkpoint_name = f"{operation_name or func.__name__}_end"
+            performance_tracker.add_checkpoint(checkpoint_name)
+            
+            # 연산 카운트 증가
+            performance_tracker.log_operation(operation_name or func.__name__)
+            
+            return result
+        return wrapper
+    return decorator
+
+def log_execution_time(logger=None):
+    """함수 실행 시간을 로깅하는 데코레이터"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if logger is None:
+                log = logging.getLogger()
+            else:
+                log = logger
+                
+            start_time = time.time()
+            result = func(*args, **kwargs)
+            elapsed_time = time.time() - start_time
+            
+            log.info(f"함수 '{func.__name__}' 실행 시간: {elapsed_time:.2f} 초")
+            
+            return result
+        return wrapper
+    return decorator
