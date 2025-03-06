@@ -8,6 +8,9 @@ import psutil
 import matplotlib.pyplot as plt
 import numpy as np
 import json
+import sys
+from tqdm import tqdm
+from datetime import datetime
 
 class PerformanceLogger:
     """
@@ -20,9 +23,9 @@ class PerformanceLogger:
         # 로깅 설정
         self.logger = logging.getLogger("PerformanceLogger")
         self.logger.setLevel(logging.INFO)
-        
         # 로그 파일 핸들러
-        log_file = os.path.join(log_dir, f"performance_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+        # 로그 파일 핸들러
+        log_file = os.path.join(log_dir, f"performance_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
         file_handler = logging.FileHandler(log_file)
         file_handler.setLevel(logging.INFO)
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -48,7 +51,6 @@ class PerformanceLogger:
     def log_hardware_info(self):
         """시스템 하드웨어 정보 로깅"""
         # CPU 정보
-        cpu_count = os.cpu_count()
         cpu_info = f"CPU 코어 수: {cpu_count}"
         
         # 메모리 정보
@@ -240,6 +242,168 @@ class PerformanceLogger:
         plt.tight_layout()
         plt.savefig(os.path.join(self.log_dir, f"performance_graphs_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"))
         plt.close()
+
+class CustomProgressBar:
+    """진행 상황을 표시하는 커스텀 프로그레스 바"""
+    
+    def __init__(self, total, desc='진행 중', width=50):
+        self.total = total
+        self.desc = desc
+        self.width = 50
+        self.current = 0
+        self.start_time = time.time()
+        self.update(0)
+    
+    def update(self, progress):
+        """진행도를 업데이트하고 표시합니다."""
+        self.current += progress
+        percentage = min(100, max(0, int(self.current / self.total * 100)))
+        filled_length = int(self.width * percentage / 100)
+        bar = '█' * filled_length + '-' * (self.width - filled_length)
+        
+        # 경과 시간
+        elapsed = time.time() - self.start_time
+        
+        # 예상 남은 시간
+        if percentage > 0:
+            eta = elapsed / percentage * (100 - percentage)
+            eta_str = self._format_time(eta)
+        else:
+            eta_str = "계산 중..."
+        
+        sys.stdout.write(f'\r{self.desc}: |{bar}| {percentage}% 완료 - 경과: {self._format_time(elapsed)} - 남은 시간: {eta_str}')
+        sys.stdout.flush()
+        
+        # 100%에 도달하면 줄바꿈
+        if percentage == 100:
+            print()
+    
+    def _format_time(self, seconds):
+        """초를 사람이 읽기 쉬운 형식으로 변환"""
+        if seconds < 60:
+            return f"{seconds:.1f}초"
+        elif seconds < 3600:
+            minutes, seconds = divmod(seconds, 60)
+            return f"{int(minutes)}분 {int(seconds)}초"
+        else:
+            hours, remainder = divmod(seconds, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            return f"{int(hours)}시간 {int(minutes)}분"
+
+class PrettyLogger:
+    """보기 좋은 로그 포맷을 제공하는 로거 클래스"""
+    
+    def __init__(self, name, log_dir='logs', console_level=logging.INFO, file_level=logging.DEBUG):
+        self.logger = logging.getLogger(name)
+        self.logger.setLevel(logging.DEBUG)
+        
+        # 기존 핸들러 제거
+        for handler in self.logger.handlers[:]:
+            self.logger.removeHandler(handler)
+        
+        # 디렉토리 생성
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # 콘솔 핸들러
+        console = logging.StreamHandler()
+        console.setLevel(console_level)
+        
+        # 파일 핸들러
+        log_file = f"{log_dir}/{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(file_level)
+        
+        # 포맷터
+        formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)8s | %(name)s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        console.setFormatter(formatter)
+        file_handler.setFormatter(formatter)
+        
+        self.logger.addHandler(console)
+        self.logger.addHandler(file_handler)
+    
+    def info(self, msg, *args, **kwargs):
+        self.logger.info(msg, *args, **kwargs)
+    
+    def debug(self, msg, *args, **kwargs):
+        self.logger.debug(msg, *args, **kwargs)
+    
+    def warning(self, msg, *args, **kwargs):
+        self.logger.warning(msg, *args, **kwargs)
+    
+    def error(self, msg, *args, **kwargs):
+        self.logger.error(msg, *args, **kwargs)
+    
+    def critical(self, msg, *args, **kwargs):
+        self.logger.critical(msg, *args, **kwargs)
+    
+    def section(self, title):
+        """섹션 구분선 출력"""
+        self.logger.info("\n" + "="*50)
+        self.logger.info(f" {title} ".center(50, "="))
+        self.logger.info("="*50)
+    
+    def subsection(self, title):
+        """소섹션 구분선 출력"""
+        self.logger.info("\n" + "-"*40)
+        self.logger.info(f" {title} ")
+        self.logger.info("-"*40)
+    
+    def result_table(self, df, title=None):
+        """데이터프레임을 테이블 형태로 출력"""
+        if title:
+            self.subsection(title)
+        
+        # 데이터프레임을 문자열로 변환하여 로깅
+        table_str = df.to_string()
+        for line in table_str.split('\n'):
+            self.logger.info(line)
+
+def setup_logging(name="KAIM-ML", level=logging.INFO):
+    """
+    애플리케이션에 대한 로깅을 설정합니다.
+    
+    Args:
+        name: 로거 이름
+        level: 로깅 레벨
+    
+    Returns:
+        구성된 로거 인스턴스
+    """
+    return PrettyLogger(name, console_level=level).logger
+
+def tqdm_with_logging(iterable, logger, desc="진행 중", level=logging.INFO):
+    """
+    tqdm 진행 표시줄과 함께 로깅을 지원하는 래퍼
+    
+    Args:
+        iterable: 반복 가능한 객체
+        logger: 로깅에 사용할 로거
+        desc: 진행 표시줄 설명
+        level: 로깅 레벨
+    
+    Returns:
+        tqdm 객체
+    """
+    # 시작 로깅
+    logger.log(level, f"{desc} 시작...")
+    
+    # tqdm으로 감싸기
+    with tqdm(iterable, desc=desc) as pbar:
+        # 원본 업데이트 메서드 저장
+        original_update = pbar.update
+        
+        # 업데이트 메서드 재정의
+        def update_with_logging(n=1):
+            original_update(n)
+            if pbar.n == pbar.total:
+                logger.log(level, f"{desc} 완료 ({pbar.format_dict['elapsed']:.2f}초)")
+        
+        pbar.update = update_with_logging
+        yield from pbar
 
 # 전역 성능 로거 인스턴스
 performance_logger = None

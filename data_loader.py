@@ -4,6 +4,7 @@ from pymongo import MongoClient
 import datetime
 import os
 import logging
+import numpy as np  # NumPy 모듈 추가
 from dotenv import load_dotenv
 
 # .env 파일 로드
@@ -87,6 +88,15 @@ def load_data_from_mongo():
     if df_list:
         df = pd.concat(df_list, axis=0, ignore_index=True)
         print(f"최종 데이터프레임 크기: {df.shape}")
+        
+        # 리스트 형태의 데이터 확인 및 처리
+        for col in df.columns:
+            if df[col].apply(lambda x: isinstance(x, list)).any():
+                print(f"컬럼 '{col}'에 리스트 형태의 값이 있습니다. 처리 중...")
+                df[col] = df[col].apply(
+                    lambda x: x[0] if isinstance(x, list) and len(x) > 0 else 
+                             (np.mean(x) if isinstance(x, list) else x)
+                )
     else:
         df = pd.DataFrame()
         print("로드된 데이터가 없습니다.")

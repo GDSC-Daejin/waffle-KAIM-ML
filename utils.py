@@ -553,3 +553,129 @@ def log_execution_time(logger=None):
             return result
         return wrapper
     return decorator
+
+def optimize_memory_usage():
+    """
+    128GB RAM과 E5-2683v4 CPU에 최적화된 메모리 관리
+    """
+    import gc
+    
+    # 가비지 컬렉션 임계값 조정
+    gc.set_threshold(700, 10, 5)
+    
+    # pandas 메모리 사용량 최적화
+    pd.options.mode.chained_assignment = None
+    
+    # NumPy 메모리 풀 최적화
+    np.set_printoptions(precision=6, threshold=100, edgeitems=3)
+    
+    # PyTorch 캐시 최적화
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # CPU 코어 수 확인
+    cpu_count = os.cpu_count()
+    print(f"사용 가능한 CPU 코어 수: {cpu_count}")
+    
+    # 대용량 RAM 감지 및 설정
+    total_ram = psutil.virtual_memory().total / (1024**3)  # GB
+    print(f"사용 가능한 총 RAM: {total_ram:.1f}GB")
+    
+    # 반환값: 권장 스레드 수, 캐시 크기(MB)
+    return min(cpu_count-2, 32), int(total_ram * 0.2 * 1024)
+
+def setup_matplotlib_korean():
+    """
+    Matplotlib에서 한글 폰트를 사용하기 위한 설정
+    """
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+    import platform
+    import os
+    
+    # 운영체제 확인
+    system_name = platform.system()
+    
+    # 사용 가능한 폰트 목록
+    korean_fonts = []
+    
+    if system_name == "Linux":
+        # 우분투/리눅스 한글 폰트 목록
+        korean_fonts = [
+            'NanumGothic', 'NanumMyeongjo', 'NanumBarunGothic',
+            'NanumSquare', 'Malgun Gothic', 'UnDotum'
+        ]
+    elif system_name == "Darwin":  # macOS
+        korean_fonts = [
+            'AppleGothic', 'Apple SD Gothic Neo', 'Nanum Gothic',
+            'NanumMyeongjo', 'NanumBarunGothic', 'NanumSquare'
+        ]
+    elif system_name == "Windows":
+        korean_fonts = [
+            'Malgun Gothic', 'Gulim', 'Batang', 'Gungsuh',
+            'NanumGothic', 'NanumMyeongjo'
+        ]
+    
+    # 사용 가능한 폰트 찾기
+    available_font = None
+    for font in korean_fonts:
+        try:
+            mpl.font_manager.findfont(font)
+            available_font = font
+            break
+        except:
+            continue
+    
+    if available_font:
+        mpl.rc('font', family=available_font)
+    else:
+        # 한글 폰트를 찾을 수 없는 경우 기본 폰트 사용
+        print("한글 폰트를 찾을 수 없습니다. 영어로 표시합니다.")
+    
+    # 음수 기호 표시 문제 해결
+    mpl.rcParams['axes.unicode_minus'] = False
+    
+    return available_font is not None
+
+def optimize_memory_usage(target_usage_percent=90):
+    """
+    메모리 사용을 최적화합니다
+    
+    Args:
+        target_usage_percent: 목표 메모리 사용률 (기본값: 90%)
+    """
+    import gc
+    import psutil
+    
+    # 가비지 컬렉션 직접 실행
+    gc.collect()
+    
+    # NumPy 및 PyTorch 캐시 정리
+    try:
+        import numpy as np
+        np.set_printoptions(precision=4, suppress=True)
+    except:
+        pass
+        
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except:
+        pass
+    
+    # 메모리 사용 정보 출력
+    try:
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        
+        # 시스템 메모리 정보
+        system_memory = psutil.virtual_memory()
+        
+        print(f"사용 가능한 CPU 코어 수: {os.cpu_count()}")
+        print(f"사용 가능한 총 RAM: {system_memory.total/(1024**3):.1f}GB")
+        print(f"프로세스 메모리 사용: {memory_info.rss/(1024**3):.2f}GB")
+        
+        return True
+    except:
+        return False

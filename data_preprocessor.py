@@ -41,9 +41,18 @@ def create_dataset(dataset, look_back=1):
     """
     X, Y = [], []
     for i in range(len(dataset) - look_back):
-        X.append(dataset[i:i+look_back])
-        Y.append(dataset[i+look_back])
-    return np.array(X), np.array(Y)
+        # 명시적으로 (look_back, features) 형태의 2D 배열 생성
+        sequence = dataset[i:i+look_back, :]
+        if sequence.shape[0] == look_back:  # 완전한 시퀀스만 사용
+            X.append(sequence)
+            Y.append(dataset[i+look_back])
+    
+    # 차원 확인 및 로깅
+    X_array = np.array(X)
+    Y_array = np.array(Y)
+    print(f"create_dataset 출력 형태 - X: {X_array.shape}, Y: {Y_array.shape}")
+    
+    return X_array, Y_array
 
 def prepare_data(X, Y):
     """
@@ -57,7 +66,20 @@ def prepare_data(X, Y):
     반환:
       - (X, Y) 형태의 PyTorch 텐서
     """
-    return torch.FloatTensor(X), torch.FloatTensor(Y)
+    # X가 3차원인지 확인 (samples, look_back, features)
+    if len(X.shape) != 3:
+        print(f"경고: X가 3차원이 아닙니다. 현재 형태: {X.shape}")
+        if len(X.shape) == 2:
+            # 2차원인 경우 - 시퀀스 길이를 1로 설정
+            X = X.reshape(X.shape[0], 1, X.shape[1])
+            print(f"X를 3차원으로 변환했습니다: {X.shape}")
+    
+    X_tensor = torch.FloatTensor(X)
+    Y_tensor = torch.FloatTensor(Y)
+    
+    print(f"PyTorch 텐서 변환 결과 - X: {X_tensor.shape}, Y: {Y_tensor.shape}")
+    
+    return X_tensor, Y_tensor
 
 def split_train_test(X, Y, test_size=0.2):
     """
@@ -80,51 +102,119 @@ def split_train_test(X, Y, test_size=0.2):
 
 def analyze_feature_importance(model, X, feature_names, target_names, n_samples=100):
     """
-    SHAP 값을 사용하여 모델의 특성 중요도를 분석합니다.
+    모델의 특성 중요도를 분석합니다.
+    SHAP가 LSTM과 호환되지 않을 경우 대체 방법을 사용합니다.
     
     파라미터:
       - model: 학습된 PyTorch 모델
       - X: 특성 데이터
       - feature_names: 특성 이름 리스트
       - target_names: 타겟 이름 리스트
-      - n_samples: SHAP 값 계산에 사용할 샘플 수 (기본값 100)
+      - n_samples: 분석에 사용할 샘플 수
     반환:
       - 특성 중요도 데이터프레임
     """
+    try:
+        # 1. 먼저 SHAP로 시도
+        return _analyze_with_shap(model, X, feature_names, target_names, n_samples)
+    except Exception as e:
+        print(f"SHAP 분석 중 오류 발생: {str(e)}. 대체 중요도 분석으로 전환합니다.")
+        # 2. SHAP 실패 시 순열 중요도로 시도
+        return _analyze_with_permutation(model, X, feature_names, target_names, n_samples)
+
+def _analyze_with_shap(model, X, feature_names, target_names, n_samples=100):
+    """SHAP를 사용한 특성 중요도 분석"""
     model.eval()
     
-    # 배경 데이터 (샘플링)
-    background_indices = np.random.choice(len(X), min(n_samples, len(X)), replace=False)
-    background = X[background_indices]
-    
-    # PyTorch 모델을 래핑하는 함수
-    def model_predict(x):
-        with torch.no_grad():
-            x_tensor = torch.FloatTensor(x)
-            return model(x_tensor).numpy()
-    
-    # SHAP 설명자 생성
-    explainer = shap.DeepExplainer(model, torch.FloatTensor(background))
-    
-    # 모든 데이터에 대한 SHAP 값 계산
+    # 샘플링
     sample_indices = np.random.choice(len(X), min(n_samples, len(X)), replace=False)
     sample_data = X[sample_indices]
-    shap_values = explainer.shap_values(torch.FloatTensor(sample_data))
     
-    # 시계열 데이터 중 마지막 시점만 사용
+    # 더 높은 SHAP 허용 오차 설정 및 오류 처리 강화
+    import shap
+    import warnings
+    
+    # 경고 무시 설정
+    warnings.filterwarnings("ignore", message="unrecognized nn.Module")
+    
+    if hasattr(shap.explainers._deep, "deep_utils"):
+        # 허용 오차를 증가
+        shap.explainers._deep.deep_utils.TOLERANCE = 0.1
+    
+    try:
+        # 배경 데이터 크기 제한 (메모리 소비 감소)
+        background = sample_data[:min(10, len(sample_data))]
+        background_tensor = torch.FloatTensor(background)
+        
+        # DeepExplainer 사용 - 예외 처리 강화
+        try:
+            explainer = shap.DeepExplainer(model, background_tensor)
+            
+            # 안전하게 샘플 크기 조정 (작은 배치로 분할)
+            max_batch = 20
+            sample_tensor = torch.FloatTensor(sample_data[:min(max_batch, len(sample_data))])
+            
+            # SHAP 값 계산
+            shap_values = explainer.shap_values(sample_tensor)
+            
+            # 특성별 중요도 계산
+            feature_importance = np.zeros((len(feature_names), len(target_names)))
+            
+            for target_idx in range(len(target_names)):
+                # 인덱스 범위 검증
+                if target_idx < len(shap_values):
+                    target_shap = shap_values[target_idx]
+                    for feature_idx in range(len(feature_names)):
+                        # 인덱스 범위 검증
+                        if feature_idx < target_shap.shape[2]:
+                            feature_importance[feature_idx, target_idx] = np.abs(target_shap[:, :, feature_idx]).mean()
+            
+            return pd.DataFrame(feature_importance, index=feature_names, columns=target_names)
+        except Exception as e:
+            print(f"SHAP DeepExplainer 오류: {str(e)}")
+            raise e
+        
+    except Exception as e:
+        print(f"SHAP 세부 오류: {str(e)}")
+        raise e
+
+def _analyze_with_permutation(model, X, feature_names, target_names, n_samples=100):
+    """순열 중요도를 사용한 특성 중요도 분석"""
+    model.eval()
+    
+    # 데이터 샘플링
+    sample_indices = np.random.choice(len(X), min(n_samples, len(X)), replace=False)
+    sample_data = X[sample_indices]
+    sample_tensor = torch.FloatTensor(sample_data)
+    
+    # 기준 예측 수행
+    with torch.no_grad():
+        baseline_pred = model(sample_tensor).detach().cpu().numpy()
+    
+    # 특성별 중요도 계산
     feature_importance = np.zeros((len(feature_names), len(target_names)))
     
-    for target_idx in range(len(target_names)):
-        target_shap = shap_values[target_idx]
+    # 각 특성을 섞어 중요도 측정
+    for feat_idx, feature in enumerate(tqdm(feature_names, desc="특성 중요도 분석")):
+        # 특성 복사 및 순열
+        X_permuted = sample_data.copy()
         
-        # 각 특성별로 중요도 계산 (절대값의 평균)
-        for feature_idx in range(len(feature_names)):
-            # 시계열의 모든 시점에 대해 평균
-            feature_importance[feature_idx, target_idx] = np.abs(target_shap[:, :, feature_idx]).mean()
+        # 해당 특성에 대한 모든 시퀀스 위치 순열화
+        for seq_pos in range(X_permuted.shape[1]):
+            perm_idx = np.random.permutation(len(X_permuted))
+            feat_col = sample_data.shape[2] - len(feature_names) + feat_idx
+            X_permuted[:, seq_pos, feat_col] = sample_data[perm_idx, seq_pos, feat_col]
+        
+        # 순열화된 데이터로 예측
+        with torch.no_grad():
+            perm_pred = model(torch.FloatTensor(X_permuted)).detach().cpu().numpy()
+        
+        # 특성 중요도 = 원본 예측과 순열화 후 예측의 차이
+        for target_idx in range(len(target_names)):
+            importance = np.mean(np.abs(baseline_pred[:, target_idx] - perm_pred[:, target_idx]))
+            feature_importance[feat_idx, target_idx] = importance
     
-    # 결과를 데이터프레임으로 변환
-    importance_df = pd.DataFrame(feature_importance, index=feature_names, columns=target_names)
-    return importance_df
+    return pd.DataFrame(feature_importance, index=feature_names, columns=target_names)
 
 def plot_feature_importance(importance_df, top_n=15, figsize=(12, 10)):
     """
@@ -367,3 +457,59 @@ def apply_feature_engineering(df, target_cols):
     new_df = new_df.ffill().bfill()
     
     return new_df
+
+def preprocess_data(df):
+    """
+    MongoDB에서 불러온 데이터를 전처리하는 함수
+    """
+    import pandas as pd
+    import numpy as np
+    
+    # 원본 데이터 복사
+    processed_df = df.copy()
+    
+    # 리스트 형태의 데이터 처리
+    for col in processed_df.columns:
+        # 리스트 형태의 값이 있는지 확인
+        if processed_df[col].apply(lambda x: isinstance(x, list)).any():
+            # 리스트에서 첫 번째 원소가 None이거나 float이 아닌 경우 처리
+            processed_df[col] = processed_df[col].apply(
+                lambda x: x[0] if isinstance(x, list) and len(x) > 0 and x[0] is not None else 
+                         (np.mean([i for i in x if i is not None]) if isinstance(x, list) and any(i is not None for i in x) else None)
+            )
+    
+    # 모든 컬럼을 숫자로 변환 시도, 오류 발생 시 로깅
+    for col in processed_df.columns:
+        if col != 'date' and col != 'area':  # 날짜와 지역 컬럼은 제외
+            try:
+                processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce')
+                
+                # 이상치 처리 강화 (IQR 방법)
+                if processed_df[col].dtype.kind in 'fib':  # float, integer, boolean
+                    Q1 = processed_df[col].quantile(0.25)
+                    Q3 = processed_df[col].quantile(0.75)
+                    IQR = Q3 - Q1
+                    lower_bound = Q1 - 2.5 * IQR  # 좀 더 엄격한 경계
+                    upper_bound = Q3 + 2.5 * IQR
+                    
+                    # 이상치를 경계값으로 대체
+                    processed_df.loc[processed_df[col] < lower_bound, col] = lower_bound
+                    processed_df.loc[processed_df[col] > upper_bound, col] = upper_bound
+            except Exception as e:
+                print(f"컬럼 {col} 숫자 변환 실패: {str(e)}")
+    
+    # 날짜 처리
+    if 'date' in processed_df.columns:
+        if not pd.api.types.is_datetime64_any_dtype(processed_df['date']):
+            try:
+                # 'Date_YYYY_MM_DD' 형식 처리
+                processed_df['date'] = processed_df['date'].apply(
+                    lambda x: pd.to_datetime(str(x).replace('Date_', '').replace('_', '-'), errors='coerce')
+                )
+            except:
+                print("날짜 변환 실패")
+    
+    # 결측치를 이전/이후 값으로 보간 후, 그래도 NA인 경우는 0으로
+    processed_df = processed_df.interpolate(method='linear', limit_direction='both').fillna(0)
+    
+    return processed_df

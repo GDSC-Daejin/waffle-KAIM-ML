@@ -166,39 +166,33 @@ def parallel_batch_process(func, items, batch_size=10, max_workers=None):
     
     return results
 
-def optimize_gpu_tensor_ops(batch_size=None, mixed_precision=True):
+def optimize_gpu_tensor_ops(mixed_precision=True):
     """
-    GPU 텐서 연산 최적화
-    
-    Args:
-        batch_size: 배치 크기 (None이면 자동 계산)
-        mixed_precision: 혼합 정밀도 사용 여부
-    
-    Returns:
-        최적화된 배치 크기
+    GTX 1080 8GB GPU에 최적화된 텐서 연산 설정
     """
     if not torch.cuda.is_available():
         return 32  # CPU 기본값
     
-    # GPU 메모리 크기에 따른 최적의 배치 크기 계산
-    gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    # GTX 1080 8GB에 최적화된 배치 크기
+    device_props = torch.cuda.get_device_properties(0)
+    gpu_mem_gb = device_props.total_memory / (1024**3)
     
-    if batch_size is None:
-        # 7.92GB GTX 1080 메모리에 최적화된 배치 크기 계산
-        if mixed_precision:
-            # FP16/FP32 혼합 정밀도 사용 시
-            batch_size = int(min(512, 32 * (gpu_mem_gb / 4)))
-        else:
-            # FP32 정밀도만 사용 시
-            batch_size = int(min(256, 16 * (gpu_mem_gb / 4)))
+    # 세밀한 배치 크기 조정
+    if mixed_precision:
+        # GTX 1080의 FP16 연산 성능은 제한적이므로 보수적으로 설정
+        batch_size = min(128, int(16 * (gpu_mem_gb / 8)))
+    else:
+        batch_size = min(64, int(8 * (gpu_mem_gb / 8)))
     
-    # 메모리 프래그멘테이션 방지
-    torch.cuda.empty_cache()
-    
-    # NVIDIA 최적화된 커널 사용
+    # 최적의 메모리 활용을 위한 NVIDIA 설정
     torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.fastest = True
     
-    print(f"GPU 메모리: {gpu_mem_gb:.2f}GB, 최적화된 배치 크기: {batch_size}")
+    # GTX 1000 시리즈는 TensorCore가 없으므로 FP16 최적화는 제한적
+    if hasattr(torch.cuda, 'amp') and mixed_precision:
+        print("FP16/FP32 혼합 정밀도 활성화")
+    
+    print(f"GPU: {device_props.name}, 메모리: {gpu_mem_gb:.2f}GB, 최적 배치 크기: {batch_size}")
     return batch_size
 
 def distribute_model_across_gpus(model, gpu_ids=None):

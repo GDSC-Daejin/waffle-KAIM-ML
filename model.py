@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import numpy as np
+import numpy as np  # 수정된 부분
 
 # Base model class for shared methods
 class BaseModel(nn.Module):
@@ -16,16 +16,43 @@ class LSTMModel(BaseModel):
         super(LSTMModel, self).__init__()
         self.hidden_dim = hidden_dim
         self.layer_dim = layer_dim
-        self.lstm = nn.LSTM(input_dim, hidden_dim, layer_dim, batch_first=True, dropout=dropout if layer_dim > 1 else 0)
-        self.fc = nn.Linear(hidden_dim, output_dim)
+        
+        # 더 강력한 정규화와 양방향 LSTM 사용
+        self.lstm = nn.LSTM(
+            input_dim, 
+            hidden_dim, 
+            layer_dim, 
+            batch_first=True, 
+            dropout=dropout if layer_dim > 1 else 0,
+            bidirectional=True  # 양방향 LSTM 사용
+        )
+        
+        # 양방향이므로 hidden_dim * 2
+        self.fc = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.relu = nn.ReLU()
+        self.output_layer = nn.Linear(hidden_dim, output_dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        h0 = torch.zeros(self.layer_dim, x.size(0), self.hidden_dim).to(x.device)
-        c0 = torch.zeros(self.layer_dim, x.size(0), self.hidden_dim).to(x.device)
+        # 입력 차원 확인 - 필요시 차원 추가
+        if len(x.shape) == 2:
+            # 입력이 (seq_len, feature_dim) 형태일 경우 배치 차원 추가
+            x = x.unsqueeze(0)  # 변환: (seq_len, feature_dim) -> (1, seq_len, feature_dim)
+        
+        # 배치 여부에 따라 hidden 상태 차원 조정
+        batch_size = x.size(0)
+        
+        # 중요: x와 동일한 디바이스에 hidden state 생성
+        device = x.device
+        h0 = torch.zeros(self.layer_dim, batch_size, self.hidden_dim, device=device)
+        c0 = torch.zeros(self.layer_dim, batch_size, self.hidden_dim, device=device)
+        
+        # 양방향 LSTM의 출력 처리
         out, _ = self.lstm(x, (h0, c0))
-        out = self.dropout(out[:, -1, :])
+        out = self.dropout(out[:, -1, :])  # 마지막 시퀀스의 출력 추출
         out = self.fc(out)
+        out = self.relu(out)
+        out = self.output_layer(out)
         return out
 
 # GRU model
@@ -79,7 +106,71 @@ class TransformerModel(BaseModel):
         out = self.fc(out[:, -1, :])
         return out
 
+# 앙상블 모델 클래스 추가
+class EnsembleModel(BaseModel):
+    def __init__(self, models, weights=None):
+        super(EnsembleModel, self).__init__()
+        self.models = models
+        
+        # 가중치가 제공되지 않으면 모든 모델에 동일한 가중치 할당
+        if weights is None:
+            self.weights = torch.ones(len(models)) / len(models)
+        else:
+            # 가중치 정규화
+            total_weight = sum(weights)
+            self.weights = torch.tensor([w/total_weight for w in weights])
+    
+    def to(self, device):
+        # 모든 하위 모델을 지정된 디바이스로 이동
+        for i in range(len(self.models)):
+            self.models[i] = self.models[i].to(device)
+        return self
+    
+    def forward(self, x):
+        # 각 모델의 출력을 가중치와 함께 평균
+        outputs = []
+        device = x.device
+        
+        for i, model in enumerate(self.models):
+            model_output = model(x)
+            if isinstance(model_output, torch.Tensor):
+                outputs.append(model_output * self.weights[i])
+            else:
+                outputs.append(torch.tensor(model_output, device=device) * self.weights[i])
+        
+        # 모델 출력 합산
+        ensemble_output = sum(outputs)
+        return ensemble_output
+    
+    def predict(self, x):
+        # 추론 모드로 전환
+        for model in self.models:
+            model.eval()
+        
+        # 그래디언트 계산 비활성화
+        with torch.no_grad():
+            output = self.forward(x)
+            
+            # 텐서를 NumPy 배열로 변환
+            if isinstance(output, torch.Tensor):
+                return output.cpu().numpy()
+            else:
+                return output
+
 def create_model(model_type, input_dim, hidden_dim, output_dim, **kwargs):
+    """
+    모델 타입에 따라 적절한 모델을 생성하는 함수
+    
+    Args:
+        model_type: 모델 타입 ('lstm', 'gru', 'cnn', 'transformer')
+        input_dim: 입력 차원
+        hidden_dim: 은닉 차원
+        output_dim: 출력 차원
+        **kwargs: 추가 파라미터
+        
+    Returns:
+        생성된 모델 인스턴스
+    """
     if model_type == 'lstm':
         return LSTMModel(input_dim, hidden_dim, kwargs.get('layer_dim', 1), output_dim, kwargs.get('dropout', 0.2))
     elif model_type == 'gru':
