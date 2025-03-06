@@ -17,22 +17,28 @@ from tqdm import tqdm
 import pickle
 import matplotlib.pyplot as plt
 import sys
-from dotenv import load_dotenv  # dotenv 추가
+from dotenv import load_dotenv
+from price_constraint_validator import FuelPriceConstraintValidator
 
 # .env 파일 로드
 load_dotenv()
 
 # 환경 변수 값 읽기
-EPOCHS = int(os.getenv("EPOCHS", "100"))
-IMPORTANCE_EPOCHS = int(os.getenv("IMPORTANCE_EPOCHS", "50"))
+EPOCHS = int(os.getenv("EPOCHS", "1000"))
+IMPORTANCE_EPOCHS = int(os.getenv("IMPORTANCE_EPOCHS", "500"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))
-PATIENCE = int(os.getenv("PATIENCE", "10"))
-ENSEMBLE_SIZE = int(os.getenv("ENSEMBLE_SIZE", "3"))
+PATIENCE = int(os.getenv("PATIENCE", "30"))
+ENSEMBLE_SIZE = int(os.getenv("ENSEMBLE_SIZE", "5"))
+MIN_DELTA = float(os.getenv("MIN_DELTA", "0.0001"))
+LOOK_BACK = int(os.getenv("LOOK_BACK", "7"))
+MAX_DAILY_CHANGE_PCT = float(os.getenv("MAX_DAILY_CHANGE_PCT", "1.0"))
+MAX_WEEKLY_CHANGE_PCT = float(os.getenv("MAX_WEEKLY_CHANGE_PCT", "3.5"))
+SMOOTHING_FACTOR = float(os.getenv("SMOOTHING_FACTOR", "0.6"))
 
 class OilPriceEnsembleTrainer:
     """유가 예측을 위한 앙상블 모델 트레이너"""
-    def __init__(self, features_df, target_cols, look_back=3, test_size=0.2,
-                ensemble_size=5, use_gpu=True, cache_dir='model_cache'):
+    def __init__(self, features_df, target_cols, look_back=None, test_size=0.2,
+                ensemble_size=None, use_gpu=True, cache_dir='model_cache'):
         """
         초기화
         
@@ -41,15 +47,17 @@ class OilPriceEnsembleTrainer:
             target_cols: 타겟 컬럼 리스트
             look_back: 시계열 윈도우 크기
             test_size: 테스트 데이터 비율
-            ensemble_size: 앙상블에 포함할 모델 수
+            ensemble_size: 앙상블에 포함할 모델 수 (None이면 환경변수 사용)
             use_gpu: GPU 사용 여부
             cache_dir: 모델 캐시 디렉토리
         """
         self.features_df = features_df
         self.target_cols = target_cols
-        self.look_back = look_back
+        self.look_back = look_back if look_back is not None else LOOK_BACK
         self.test_size = test_size
-        self.ensemble_size = ensemble_size
+        
+        # 환경 변수의 기본값 사용 (None이면)
+        self.ensemble_size = ensemble_size if ensemble_size is not None else ENSEMBLE_SIZE
         self.use_gpu = use_gpu
         
         # 모델 캐시 디렉토리 생성
@@ -70,6 +78,7 @@ class OilPriceEnsembleTrainer:
         # 로깅 설정
         self.setup_logger()
         self.logger.info(f"시스템 리소스: CPU {cpu_count}코어, GPU {torch.cuda.device_count()}개, 사용 워커: {self.num_workers}개")
+        self.logger.info(f"앙상블 모델 크기: {self.ensemble_size}, 시계열 윈도우: {self.look_back}일, 인내심: {PATIENCE}")
         
         # 초기 데이터 준비
         self.prepare_data()
@@ -140,7 +149,7 @@ class OilPriceEnsembleTrainer:
             fh = logging.FileHandler(f"{log_dir}/training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
             fh.setLevel(logging.INFO)
             
-            # 포맷 설정 수정 - %(level)s를 %(levelname)s로 변경
+            # 포맷 설정
             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             ch.setFormatter(formatter)
             fh.setFormatter(formatter)
@@ -166,7 +175,7 @@ class OilPriceEnsembleTrainer:
             self.logger.info(f"발견된 지역: {self.regions}")
             self.is_region_data = True
             
-            # area 컬럼을 제거ㄴㄴ
+            # area 컬럼을 제거
             features = features.drop(['area'], axis=1)
         else:
             self.regions = ['National']
@@ -262,7 +271,7 @@ class OilPriceEnsembleTrainer:
                 columns=self.target_names
             )
 
-    def train_region_models(self, epochs=None, batch_size=None, patience=None):
+    def train_region_models(self, epochs=None, batch_size=None, patience=None, min_delta=None):
         """지역별 모델 학습"""
         # 기본값이 None인 경우 .env 설정 사용
         if epochs is None:
@@ -276,13 +285,15 @@ class OilPriceEnsembleTrainer:
                 batch_size = min(2048, int(total_ram / 16))  # RAM 크기에 맞춤
         if patience is None:
             patience = PATIENCE
+        if min_delta is None:
+            min_delta = MIN_DELTA
         
-        self.logger.info(f"학습 설정: 에포크 {epochs}, 배치 크기 {batch_size}, 인내심 {patience}")
+        self.logger.info(f"학습 설정: 에포크 {epochs}, 배치 크기 {batch_size}, 인내심 {patience}, 최소개선율 {min_delta}")
         
         # 단일 데이터셋 처리
         if not self.is_region_data:
             self.logger.info("지역 정보가 없어 전체 데이터로 단일 모델 학습 중...")
-            ensemble = self._train_models_for_region(self.X_train, self.Y_train, epochs, batch_size, patience)
+            ensemble = self._train_models_for_region(self.X_train, self.Y_train, epochs, batch_size, patience, min_delta)
             self.region_models['National'] = ensemble
             self.target_scalers['National'] = self.scaler
             return
@@ -338,7 +349,7 @@ class OilPriceEnsembleTrainer:
             
             # 앙상블 모델 학습
             self.logger.info(f"{progress} {region} 지역 앙상블 모델 학습 시작")
-            ensemble = self._train_models_for_region(X_train, Y_train, epochs, batch_size, patience, model_configs)
+            ensemble = self._train_models_for_region(X_train, Y_train, epochs, batch_size, patience, min_delta, model_configs)
             self.logger.info(f"{progress} {region} 지역 앙상블 모델 학습 완료")
             
             # 결과 저장
@@ -355,7 +366,7 @@ class OilPriceEnsembleTrainer:
             
         self.logger.info(f"{len(self.region_models)}개 지역에 대한 모델 학습 완료")
 
-    def _train_models_for_region(self, X_train, Y_train, epochs=100, batch_size=32, patience=10, model_configs=None):
+    def _train_models_for_region(self, X_train, Y_train, epochs=100, batch_size=32, patience=30, min_delta=0.0001, model_configs=None):
         """한 지역에 대한 앙상블 모델 학습"""
         if model_configs is None:
             model_configs = self.model_configs
@@ -375,11 +386,12 @@ class OilPriceEnsembleTrainer:
             batch_size = min(batch_size, 12)
             self.logger.info(f"GPU 메모리 안전을 위해 배치 크기를 {batch_size}로 조정했습니다.")
         
-        # 다양한 모델 훈련
+        # 다양한 모델 훈련 - 명시적으로 앙상블 크기를 제한
         for i, config in enumerate(model_configs[:self.ensemble_size]):
             model_type = config.get('model_type', 'lstm')
             
-            self.logger.info(f"모델 {i+1}/{len(model_configs[:self.ensemble_size])} ({model_type}) 훈련 중...")
+            # 로그 메시지 수정: 현재 모델/총 앙상블 크기
+            self.logger.info(f"모델 {i+1}/{self.ensemble_size} ({model_type}) 훈련 중...")
             
             try:
                 # 훈련 시작 전 GPU 메모리 정리
@@ -410,15 +422,17 @@ class OilPriceEnsembleTrainer:
                 if isinstance(Y_val, torch.Tensor):
                     Y_val_cpu = Y_val.cpu()  # 일단 CPU에 보관
                 else:
-                    X_val_cpu = torch.FloatTensor(Y_val)
+                    Y_val_cpu = torch.FloatTensor(Y_val)
                 
-                # 모델 학습 (수정된 train_model은 내부에서 디바이스 처리)
+                # 모델 학습
                 model, history = train_model(
                     model, 
                     X_train_tensor, 
                     Y_train_tensor, 
                     epochs=epochs, 
-                    batch_size=batch_size, 
+                    batch_size=batch_size,
+                    patience=patience,
+                    min_delta=min_delta,
                     verbose=5
                 )
                 
@@ -469,7 +483,7 @@ class OilPriceEnsembleTrainer:
                 # 오류 발생 시 다음 모델로 계속 진행
                 continue
             finally:
-                # 메모리 정리 (finally 블록에서 항상 실행)
+                # 메모리 정리
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         
@@ -479,13 +493,17 @@ class OilPriceEnsembleTrainer:
         
         # 가중치 계산 방식 개선
         if models:
-            # 지수 가중치 적용
-            weights = np.array(weights)
-            weights = weights / weights.sum()  # 정규화
+            # 지수 가중치 적용 대신 최근 실적 기반 가중치 계산
+            recent_weights = np.exp(-np.array(val_losses) * 2)  # 지수 감쇠 강화
+            weights = recent_weights / recent_weights.sum()  # 정규화
             self.logger.info(f"모델 가중치: {weights.round(3)}")
             
-            # 앙상블 모델 생성
-            ensemble = EnsembleModel(models, weights)
+            # 앙상블 강화를 위한 부스팅 적용
+            ensemble = EnhancedEnsembleModel(models, weights, prediction_constraints={
+                'max_daily_change_pct': MAX_DAILY_CHANGE_PCT,  # 환경 변수에서 설정
+                'max_weekly_change_pct': MAX_WEEKLY_CHANGE_PCT,  # 환경 변수에서 설정
+                'smoothing_factor': SMOOTHING_FACTOR,  # 환경 변수에서 설정
+            })
         
         return ensemble
 
@@ -536,8 +554,6 @@ class OilPriceEnsembleTrainer:
                 for step in range(future_steps):
                     # 현재 시퀀스로 예측
                     input_tensor = torch.FloatTensor(current_sequence).unsqueeze(0)  # 배치 차원 추가
-                    
-                    # 예측
                     with torch.no_grad():
                         pred = model(input_tensor).detach().cpu().numpy()[0]  # 배치 차원 제거
                         
@@ -601,7 +617,6 @@ class OilPriceEnsembleTrainer:
                                 curr_vals[i] = (curr_vals[i-1] + curr_vals[i+1]) / 2
                             else:
                                 curr_vals[i] = curr_vals[i-1]  # 마지막 값은 이전 값으로
-                    
                     pred_df[col] = curr_vals
                 
                 # 결과 저장
@@ -620,9 +635,32 @@ class OilPriceEnsembleTrainer:
                 import traceback
                 self.logger.error(traceback.format_exc())
         
+        # 예측 결과를 가져온 후 제약조건 적용하여 보정
+        validator = FuelPriceConstraintValidator(
+            max_daily_change_pct=MAX_DAILY_CHANGE_PCT,
+            max_weekly_change_pct=MAX_WEEKLY_CHANGE_PCT,
+            smoothing_factor=SMOOTHING_FACTOR,
+            price_relationships={
+                'premium_gasoline_to_gasoline': 200,
+                'gasoline_to_diesel': 120,
+                'diesel_to_kerosene': 50
+            }
+        )
+        # 각 지역별 예측 보정
+        for region, pred_df in predictions.items():
+            # 제약조건 적용하여 예측값 보정
+            adjusted_df = validator.validate_predictions(pred_df)
+            predictions[region] = adjusted_df
+            
+            # 보정 후 통계 출력
+            summary_stats = adjusted_df.describe().loc[['mean', 'min', 'max']]
+            self.logger.info(f"[보정 후] {region} 지역 예측 통계:")
+            for stat, values in summary_stats.iterrows():
+                self.logger.info(f" - {stat}: {dict(values.round(1))}")
+        
         self.logger.info(f"총 {len(predictions)}개 지역에 대한 예측 완료")
         return predictions
-
+        
     def save_models(self):
         """학습된 모델 저장"""
         models_dir = os.path.join(self.cache_dir, 'trained_models')
@@ -637,7 +675,6 @@ class OilPriceEnsembleTrainer:
             'regions': list(self.region_models.keys()),
             'feature_names': self.feature_names
         }
-        
         meta_path = os.path.join(models_dir, 'metadata.json')
         with open(meta_path, 'w') as f:
             json.dump(metadata, f, indent=2)
@@ -658,7 +695,7 @@ class OilPriceEnsembleTrainer:
                 pickle.dump(self.target_scalers[region], f)
         
         self.logger.info(f"모든 모델이 {models_dir}에 저장되었습니다.")
-
+        
     def load_models(self):
         """저장된 모델 로드"""
         models_dir = os.path.join(self.cache_dir, 'trained_models')
@@ -672,7 +709,6 @@ class OilPriceEnsembleTrainer:
             region_path = os.path.join(models_dir, region_dir)
             if os.path.isdir(region_path) and not region_dir.startswith('.'):
                 region = region_dir.replace('_', ' ')
-                
                 model_path = os.path.join(region_path, 'ensemble_model.pkl')
                 scaler_path = os.path.join(region_path, 'scaler.pkl')
                 
@@ -694,7 +730,7 @@ class OilPriceEnsembleTrainer:
         else:
             self.logger.warning("로드할 모델이 없습니다.")
             return False
-
+        
     def plot_predictions(self, predictions, save_path=None):
         """예측 결과를 시각화"""
         # 경고 메시지 숨기기
@@ -717,7 +753,6 @@ class OilPriceEnsembleTrainer:
             ax.set_ylabel("Price (KRW)", fontsize=12)
             ax.grid(True)
             ax.legend()
-            
             plt.tight_layout()
             
             if save_path:
@@ -728,10 +763,9 @@ class OilPriceEnsembleTrainer:
                 plt.show()
             
             plt.close()
-
-
+            
 def run_ensemble_prediction_pipeline(features_df, target_cols, look_back=3, future_steps=7, 
-                                    ensemble_size=None, use_gpu=True, batch_size=None):
+                                   ensemble_size=None, use_gpu=True, batch_size=None):
     """
     앙상블 예측 파이프라인 실행
     
@@ -740,19 +774,22 @@ def run_ensemble_prediction_pipeline(features_df, target_cols, look_back=3, futu
         target_cols: 타겟 컬럼 리스트
         look_back: 시계열 윈도우 크기
         future_steps: 예측할 미래 일 수
-        ensemble_size: 앙상블에 포함할 모델 수
+        ensemble_size: 앙상블에 포함할 모델 수 (None이면 환경변수 사용)
         use_gpu: GPU 사용 여부
         batch_size: 학습 배치 크기 (None이면 자동 설정)
-    
+        
     Returns:
         지역별 예측 결과
     """
+    # 환경 변수에서 설정 가져오기 (None인 경우)
+    if ensemble_size is None:
+        ensemble_size = ENSEMBLE_SIZE
+    
     # 로거 설정
     logger = logging.getLogger("EnsemblePipeline")
     logger.setLevel(logging.INFO)
     if not logger.handlers:
         handler = logging.StreamHandler()
-        # 포맷 설정 수정 - %(level)s를 %(levelname)s로 변경
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         handler.setFormatter(formatter)
         logger.addHandler(handler)
@@ -859,7 +896,6 @@ def run_ensemble_prediction_pipeline(features_df, target_cols, look_back=3, futu
 def print_prediction_summary(predictions, future_steps):
     """예측 결과 요약을 깔끔하게 출력합니다."""
     logger = logging.getLogger("EnsemblePipeline")
-    
     logger.info("\n" + "="*50)
     logger.info(f"향후 {future_steps}일 예측 결과 요약")
     logger.info("="*50)
@@ -883,15 +919,14 @@ def print_prediction_summary(predictions, future_steps):
         for date, row in pred_df.iterrows():
             date_str = date.strftime('%Y-%m-%d') if hasattr(date, 'strftime') else str(date)
             logger.info(f"  {date_str}:")
-            
             for col in pred_df.columns:
                 price = float(row[col])  # NumPy float64를 일반 float로 변환
                 logger.info(f"    - {col}: {price:.1f}원")
     
     logger.info("\n" + "="*50)
 
+# 직접 실행 시 간단한 테스트 수행
 if __name__ == "__main__":
-    # 직접 실행 시 간단한 테스트 수행
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
     
@@ -920,8 +955,78 @@ if __name__ == "__main__":
             ensemble_size=3,
             use_gpu=torch.cuda.is_available()
         )
-        
+                
         logger.info("예측 완료!")
-        
     except Exception as e:
         logger.error(f"오류 발생: {str(e)}", exc_info=True)
+
+# 예측 결과 제약 설정을 위한 향상된 앙상블 모델 클래스
+class EnhancedEnsembleModel(EnsembleModel):
+    def __init__(self, models, weights=None, prediction_constraints=None):
+        super(EnhancedEnsembleModel, self).__init__(models, weights)
+        self.constraints = prediction_constraints or {}
+        
+        # 예측 마지막 값 저장용
+        self.last_predictions = None
+        
+    def forward(self, x):
+        """가중 앙상블 예측 수행 및 제약 적용"""
+        # 기본 앙상블 예측
+        ensemble_pred = super().forward(x)
+        
+        # 직전 예측값이 있고 제약이 설정된 경우 보정 적용
+        if self.last_predictions is not None and self.constraints:
+            # 급격한 변화 제한
+            if 'max_daily_change_pct' in self.constraints:
+                max_change = self.constraints['max_daily_change_pct'] / 100
+                for i in range(ensemble_pred.size(0)):
+                    for j in range(ensemble_pred.size(1)):
+                        prev_val = self.last_predictions[j]
+                        curr_val = ensemble_pred[i, j].item()
+                        
+                        # 변화율 계산 및 제한
+                        if prev_val != 0:
+                            change_pct = (curr_val - prev_val) / prev_val
+                            if abs(change_pct) > max_change:
+                                direction = 1 if change_pct > 0 else -1
+                                ensemble_pred[i, j] = prev_val * (1 + direction * max_change)
+        
+        # 현재 값을 다음 호출을 위해 저장
+        if ensemble_pred.size(0) == 1:  # 단일 예측인 경우만 저장
+            self.last_predictions = ensemble_pred[0].detach().clone()
+            
+        return ensemble_pred
+    
+    def predict_sequence(self, initial_sequence, steps, feature_indices=None):
+        """미래 시퀀스 예측"""
+        results = []
+        current_sequence = initial_sequence.copy()
+        
+        # 마지막 관측값으로 예측 초기화
+        self.last_predictions = None
+        
+        for step in range(steps):
+            # 현재 시퀀스로 예측
+            with torch.no_grad():
+                input_tensor = torch.FloatTensor(current_sequence).unsqueeze(0)
+                prediction = self.forward(input_tensor).detach().cpu().numpy()[0]
+            
+            results.append(prediction)
+            
+            # 피드백 루프 업데이트
+            new_row = np.zeros((1, current_sequence.shape[1]))
+            
+            # 예측값을 새 시퀀스에 삽입
+            if feature_indices:
+                for i, idx in enumerate(feature_indices):
+                    if i < len(prediction):
+                        new_row[0, idx] = prediction[i]
+            else:
+                # 기본값은 모든 타겟을 사용
+                for i in range(min(new_row.shape[1], len(prediction))):
+                    new_row[0, i] = prediction[i]
+            
+            # 마지막 행 제거하고 새 예측값 추가
+            current_sequence = np.vstack([current_sequence[1:], new_row])
+            
+        return results

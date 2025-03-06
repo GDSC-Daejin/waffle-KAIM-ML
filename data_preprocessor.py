@@ -137,9 +137,11 @@ def _analyze_with_shap(model, X, feature_names, target_names, n_samples=100):
     # 경고 무시 설정
     warnings.filterwarnings("ignore", message="unrecognized nn.Module")
     
-    if hasattr(shap.explainers._deep, "deep_utils"):
-        # 허용 오차를 증가
-        shap.explainers._deep.deep_utils.TOLERANCE = 0.1
+    # SHAP 라이브러리의 tolerance를 증가시킴 - 오류 방지를 위해 0.01에서 0.05로 증가
+    if hasattr(shap.explainers._deep, "deep_pytorch"):
+        shap.explainers._deep.deep_pytorch.op_handler.TOLERANCE = 0.05
+    elif hasattr(shap.explainers._deep, "deep_utils"):
+        shap.explainers._deep.deep_utils.TOLERANCE = 0.05
     
     try:
         # 배경 데이터 크기 제한 (메모리 소비 감소)

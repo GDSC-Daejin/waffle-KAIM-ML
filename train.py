@@ -5,7 +5,7 @@ import numpy as np
 
 from model import create_model
 
-def train_model(model, X_train, Y_train, epochs=50, batch_size=32, lr=0.001, verbose=0):
+def train_model(model, X_train, Y_train, epochs=50, batch_size=32, lr=0.001, patience=30, min_delta=0.0001, verbose=0):
     """모델을 훈련하는 함수"""
     # 디바이스 확인
     device = next(model.parameters()).device
@@ -21,10 +21,14 @@ def train_model(model, X_train, Y_train, epochs=50, batch_size=32, lr=0.001, ver
     # 히스토리 저장
     history = {'loss': []}
     
-    # 조기 종료 설정
-    patience = 10
+    # 조기 종료 설정 - 매개변수 값 사용
     best_loss = float('inf')
     patience_counter = 0
+    
+    # 학습률 스케줄러 추가 - verbose 파라미터 제거
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-6
+    )
     
     # 학습 배치 설정
     batch_size = min(batch_size, len(X_train))
@@ -82,8 +86,8 @@ def train_model(model, X_train, Y_train, epochs=50, batch_size=32, lr=0.001, ver
         if verbose > 0 and (epoch + 1) % verbose == 0:
             print(f"Epoch {epoch+1}/{epochs}, Loss: {epoch_loss:.6f}")
         
-        # 조기 종료 검사
-        if epoch_loss < best_loss:
+        # 조기 종료 조건 개선 - min_delta 사용
+        if epoch_loss < best_loss - min_delta:
             best_loss = epoch_loss
             patience_counter = 0
             # 최적 모델 저장
@@ -91,10 +95,13 @@ def train_model(model, X_train, Y_train, epochs=50, batch_size=32, lr=0.001, ver
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"조기 종료! {patience}번의 에포크 동안 개선되지 않았습니다.")
+                print(f"조기 종료! {patience}번의 에포크 동안 {min_delta} 이상의 개선이 없었습니다.")
                 # 최적 상태로 복원
                 model.load_state_dict(best_model_state)
                 break
+        
+        # 학습률 스케줄러 업데이트
+        scheduler.step(epoch_loss)
     
     return model, history
 
