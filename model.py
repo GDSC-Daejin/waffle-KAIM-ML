@@ -16,43 +16,50 @@ class LSTMModel(BaseModel):
         super(LSTMModel, self).__init__()
         self.hidden_dim = hidden_dim
         self.layer_dim = layer_dim
+        self.bidirectional = True  # 양방향 사용 여부 명시적으로 저장
         
-        # 더 강력한 정규화와 양방향 LSTM 사용
+        # LSTM 계층
         self.lstm = nn.LSTM(
             input_dim, 
             hidden_dim, 
             layer_dim, 
             batch_first=True, 
             dropout=dropout if layer_dim > 1 else 0,
-            bidirectional=True  # 양방향 LSTM 사용
+            bidirectional=self.bidirectional
         )
         
-        # 양방향이므로 hidden_dim * 2
-        self.fc = nn.Linear(hidden_dim * 2, hidden_dim)
+        # 양방향이면 hidden_dim * 2
+        fc_input_dim = hidden_dim * 2 if self.bidirectional else hidden_dim
+        self.fc = nn.Linear(fc_input_dim, hidden_dim)
         self.relu = nn.ReLU()
         self.output_layer = nn.Linear(hidden_dim, output_dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        # 입력 차원 확인 - 필요시 차원 추가
+        # 입력 차원 확인 및 조정
         if len(x.shape) == 2:
-            # 입력이 (seq_len, feature_dim) 형태일 경우 배치 차원 추가
-            x = x.unsqueeze(0)  # 변환: (seq_len, feature_dim) -> (1, seq_len, feature_dim)
-        
-        # 배치 여부에 따라 hidden 상태 차원 조정
+            x = x.unsqueeze(0)
+            
+        # 배치 크기 가져오기
         batch_size = x.size(0)
         
-        # 중요: x와 동일한 디바이스에 hidden state 생성
+        # 중요: bidirectional이면 layer_dim * 2 사용
+        num_directions = 2 if self.bidirectional else 1
         device = x.device
-        h0 = torch.zeros(self.layer_dim, batch_size, self.hidden_dim, device=device)
-        c0 = torch.zeros(self.layer_dim, batch_size, self.hidden_dim, device=device)
         
-        # 양방향 LSTM의 출력 처리
+        # 올바른 크기의 hidden state 초기화
+        h0 = torch.zeros(self.layer_dim * num_directions, batch_size, self.hidden_dim, device=device)
+        c0 = torch.zeros(self.layer_dim * num_directions, batch_size, self.hidden_dim, device=device)
+        
+        # LSTM 실행
         out, _ = self.lstm(x, (h0, c0))
-        out = self.dropout(out[:, -1, :])  # 마지막 시퀀스의 출력 추출
+        
+        # 마지막 시퀀스 출력 사용
+        out = self.dropout(out[:, -1, :])
         out = self.fc(out)
         out = self.relu(out)
         out = self.output_layer(out)
+        
         return out
 
 # GRU model

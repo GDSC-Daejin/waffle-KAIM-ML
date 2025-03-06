@@ -195,33 +195,36 @@ class OilPriceEnsembleTrainer:
         """변수 중요도 분석"""
         self.logger.info("변수 중요도 분석 시작...")
         
-        # 기본 LSTM 모델 학습
-        input_dim = self.X_train.shape[2]
-        hidden_dim = 64
-        layer_dim = 2
-        output_dim = len(self.target_indices)
-        
-        from model import LSTMModel
-        model = LSTMModel(input_dim, hidden_dim, layer_dim, output_dim)
-        
-        # 모델을 적절한 디바이스로 이동
-        model = model.to(self.device)
-        
-        # 학습 데이터도 디바이스로 이동
-        X_train_device = self.X_train.to(self.device)
-        Y_train_device = self.Y_train.to(self.device)
-        
-        # 모델 학습
-        model, _ = train_model(model, X_train_device, Y_train_device, epochs=100, batch_size=32, verbose=1)
-        
-        # CPU로 이동하여 특성 중요도 분석
-        model = model.cpu()
-        
         try:
+            # 기본 LSTM 모델 학습
+            input_dim = self.X_train.shape[2]
+            hidden_dim = 64
+            layer_dim = 2
+            output_dim = len(self.target_indices)
+            
+            from model import LSTMModel
+            model = LSTMModel(input_dim, hidden_dim, layer_dim, output_dim)
+            
+            # 모델을 적절한 디바이스로 이동
+            model = model.to(self.device)
+            
+            # 학습 데이터를 디바이스로 이동
+            X_train_device = self.X_train.to(self.device)
+            Y_train_device = self.Y_train.to(self.device)
+            
+            # 모델 학습
+            model, _ = train_model(model, X_train_device, Y_train_device, epochs=50, batch_size=32, verbose=1)
+            
+            # 중요: 분석 전에 CPU로 모델 이동
+            model = model.cpu()
+            
+            # 중요: X_test도 CPU로 이동 후 numpy 변환
+            X_test_cpu = self.X_test.cpu().numpy() if torch.is_tensor(self.X_test) else self.X_test
+            
             # 특성 중요도 분석
             importance_df = analyze_feature_importance(
                 model, 
-                self.X_test.cpu().numpy(), 
+                X_test_cpu,
                 self.feature_names, 
                 self.target_names
             )
@@ -235,8 +238,11 @@ class OilPriceEnsembleTrainer:
             return importance_df
             
         except Exception as e:
-            self.logger.warning(f"특성 중요도 분석 중 오류 발생: {str(e)}, 대체 방법 사용")
-            # 에러 발생 시 간단한 대체 방법 사용
+            self.logger.warning(f"특성 중요도 분석 중 오류 발생: {str(e)}. 대체 방법 사용")
+            import traceback
+            self.logger.warning(traceback.format_exc())
+            
+            # 대체 방법: 모든 특성에 동일한 중요도 부여
             return pd.DataFrame(
                 np.ones((len(self.feature_names), len(self.target_names))), 
                 index=self.feature_names, 
@@ -359,14 +365,25 @@ class OilPriceEnsembleTrainer:
                 
                 # 텐서 변환 (이미 텐서인 경우 변환하지 않음)
                 if isinstance(X_train_data, torch.Tensor):
-                    X_train_tensor = X_train_data
+                    X_train_tensor = X_train_data.to(self.device)
                 else:
-                    X_train_tensor = torch.FloatTensor(X_train_data)
+                    X_train_tensor = torch.FloatTensor(X_train_data).to(self.device)
                     
                 if isinstance(Y_train_data, torch.Tensor):
-                    Y_train_tensor = Y_train_data
+                    Y_train_tensor = Y_train_data.to(self.device)
                 else:
-                    Y_train_tensor = torch.FloatTensor(Y_train_data)
+                    Y_train_tensor = torch.FloatTensor(Y_train_data).to(self.device)
+                
+                # 검증 데이터도 동일한 디바이스로 이동 (중요!)
+                if isinstance(X_val, torch.Tensor):
+                    X_val_tensor = X_val.to(self.device)
+                else:
+                    X_val_tensor = torch.FloatTensor(X_val).to(self.device)
+                    
+                if isinstance(Y_val, torch.Tensor):
+                    Y_val_tensor = Y_val.to(self.device)
+                else:
+                    Y_val_tensor = torch.FloatTensor(Y_val).to(self.device)
                 
                 # 모델 학습 시 진행 표시줄 설정
                 verbose_value = 5  # 5에포크마다 출력
@@ -381,28 +398,23 @@ class OilPriceEnsembleTrainer:
                     verbose=verbose_value
                 )
                 
-                # 검증 손실 계산
+                # 검증 손실 계산 - 모델과 데이터가 같은 디바이스에 있어야 함
                 model.eval()
                 with torch.no_grad():
-                    if isinstance(X_val, torch.Tensor):
-                        val_pred = model(X_val)
-                    else:
-                        val_pred = model(torch.FloatTensor(X_val))
-                    
-                    if isinstance(Y_val, torch.Tensor):
-                        val_loss = torch.nn.MSELoss()(val_pred, Y_val).item()
-                    else:
-                        val_loss = torch.nn.MSELoss()(val_pred, torch.FloatTensor(Y_val)).item()
+                    # 여기서 X_val_tensor와 Y_val_tensor는 이미 올바른 디바이스에 있음
+                    val_pred = model(X_val_tensor)
+                    val_loss = torch.nn.MSELoss()(val_pred, Y_val_tensor).item()
+                    val_losses.append(val_loss)
                 
-                # 검증 손실 기반 가중치 계산 (훈련 손실보다 검증 손실이 더 중요)
-                val_losses.append(val_loss)
+                # 검증 손실 기반 가중치 계산
                 weight = 1.0 / (val_loss + 1e-10)  # 0으로 나누기 방지
                 
-                # CPU로 이동하여 메모리 절약
-                model = model.cpu()
-                
-                models.append(model)
+                # 디바이스 사이에서 이동할 때 복사본 생성
                 weights.append(weight)
+                
+                # CPU로 이동하여 메모리 절약 (검증 후에 이동)
+                model = model.cpu()
+                models.append(model)
                 
             except Exception as e:
                 self.logger.error(f"모델 {model_type} 학습 중 오류 발생: {str(e)}")

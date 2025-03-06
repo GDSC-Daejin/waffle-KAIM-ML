@@ -478,38 +478,44 @@ def preprocess_data(df):
                          (np.mean([i for i in x if i is not None]) if isinstance(x, list) and any(i is not None for i in x) else None)
             )
     
-    # 모든 컬럼을 숫자로 변환 시도, 오류 발생 시 로깅
+    # 모든 컬럼을 숫자로 변환 시도
     for col in processed_df.columns:
         if col != 'date' and col != 'area':  # 날짜와 지역 컬럼은 제외
             try:
-                processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce')
+                # 명시적으로 float 타입으로 변환 (int가 아님)
+                processed_df[col] = pd.to_numeric(processed_df[col], errors='coerce').astype(float)
                 
-                # 이상치 처리 강화 (IQR 방법)
-                if processed_df[col].dtype.kind in 'fib':  # float, integer, boolean
+                # 이상치 처리 - float 타입이므로 타입 충돌 없음
+                if not processed_df[col].isna().all():  # 모든 값이 NaN이 아닌 경우에만 처리
                     Q1 = processed_df[col].quantile(0.25)
                     Q3 = processed_df[col].quantile(0.75)
                     IQR = Q3 - Q1
-                    lower_bound = Q1 - 2.5 * IQR  # 좀 더 엄격한 경계
+                    lower_bound = Q1 - 2.5 * IQR
                     upper_bound = Q3 + 2.5 * IQR
                     
-                    # 이상치를 경계값으로 대체
-                    processed_df.loc[processed_df[col] < lower_bound, col] = lower_bound
-                    processed_df.loc[processed_df[col] > upper_bound, col] = upper_bound
+                    # 이상치 처리
+                    processed_df[col] = processed_df[col].clip(lower=lower_bound, upper=upper_bound)
             except Exception as e:
-                print(f"컬럼 {col} 숫자 변환 실패: {str(e)}")
+                print(f"컬럼 {col} 처리 중 오류 발생: {str(e)}")
     
     # 날짜 처리
     if 'date' in processed_df.columns:
         if not pd.api.types.is_datetime64_any_dtype(processed_df['date']):
             try:
-                # 'Date_YYYY_MM_DD' 형식 처리
                 processed_df['date'] = processed_df['date'].apply(
                     lambda x: pd.to_datetime(str(x).replace('Date_', '').replace('_', '-'), errors='coerce')
                 )
-            except:
-                print("날짜 변환 실패")
+            except Exception as e:
+                print(f"날짜 변환 중 오류: {str(e)}")
     
-    # 결측치를 이전/이후 값으로 보간 후, 그래도 NA인 경우는 0으로
-    processed_df = processed_df.interpolate(method='linear', limit_direction='both').fillna(0)
+    # infer_objects를 호출하여 데이터 타입 추론 후 interpolate 실행
+    processed_df = processed_df.infer_objects(copy=False)
+    
+    # 수치형 열만 보간 처리
+    numeric_cols = processed_df.select_dtypes(include=['number']).columns
+    if not numeric_cols.empty:
+        processed_df[numeric_cols] = processed_df[numeric_cols].interpolate(
+            method='linear', limit_direction='both'
+        ).fillna(0)
     
     return processed_df
