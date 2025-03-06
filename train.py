@@ -1,377 +1,91 @@
 import torch
-import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import concurrent.futures
-from joblib import Parallel, delayed
-import time
-from tqdm import tqdm
-import os
-from sklearn.model_selection import TimeSeriesSplit
-from utils import performance_tracker, log_execution_time, track_performance
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np  # np를 추가
 
-@log_execution_time()
-@track_performance("model_training")
-def train_model(model, X_train, Y_train, X_val=None, Y_val=None, 
-               epochs=100, batch_size=64, learning_rate=0.001,
-               patience=10, verbose=1, device=None, num_workers=None):
+from model import create_model
+
+def train_model(model, X_train, Y_train, epochs=50, batch_size=32, lr=0.001):
     """
-    모델 학습 함수
+    모델을 훈련하는 함수입니다.
     
-    Args:
-        model: 학습할 PyTorch 모델
-        X_train, Y_train: 학습 데이터
-        X_val, Y_val: 검증 데이터 (없으면 학습 데이터의 일부를 검증에 사용)
-        epochs: 학습 에포크 수
-        batch_size: 배치 크기 (성능 최적화를 위해 증가)
-        learning_rate: 학습률
-        patience: 조기 종료 인내심
-        verbose: 출력 상세도
-        device: 학습에 사용할 디바이스
-        num_workers: 데이터 로딩 작업자 수 (None이면 자동 설정)
-        
+    Parameters:
+        - model: 훈련할 모델 (예: LSTMModel)
+        - X_train: 훈련 입력 데이터 (NumPy 배열)
+        - Y_train: 훈련 목표 데이터 (NumPy 배열)
+        - epochs: 훈련할 에포크 수
+        - batch_size: 배치 크기
+        - lr: 학습률
     Returns:
-        학습된 모델, 손실 기록
+        - 학습된 모델
     """
-    # 디바이스 설정
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    X_train = np.array(X_train, dtype=np.float64)  # np.array()로 변환
+    Y_train = np.array(Y_train, dtype=np.float64)  # np.array()로 변환
+
+    X_train_tensor = torch.FloatTensor(X_train)  # np.float64로 변환
+    Y_train_tensor = torch.FloatTensor(Y_train)  # np.float64로 변환
     
-    # 디바이스 확인 및 핀 메모리 설정 결정
-    # 텐서가 이미 GPU에 있는지 확인
-    x_is_cuda = isinstance(X_train, torch.Tensor) and X_train.is_cuda
-    y_is_cuda = isinstance(Y_train, torch.Tensor) and Y_train.is_cuda
-    
-    # 이미 GPU에 있는 텐서는 CPU로 이동시키지 않음
-    # CPU 텐서만 나중에 pin_memory 사용
-    use_pin_memory = device.type == 'cuda' and not (x_is_cuda or y_is_cuda)
-    
-    # 모델을 지정된 디바이스로 이동
-    model = model.to(device)
-    
-    # 혼합 정밀도 연산 설정 (GPU 효율성 향상)
-    scaler = torch.amp.GradScaler() if device.type == 'cuda' else None
-    
-    # 옵티마이저 및 손실 함수 설정
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    # 데이터로더 준비
+    train_dataset = TensorDataset(X_train_tensor, Y_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+
+    # 옵티마이저와 손실 함수 설정
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = torch.nn.MSELoss()
-    
-    # 검증 데이터가 없으면 학습 데이터 분할
-    if X_val is None or Y_val is None:
-        val_size = int(0.2 * len(X_train))
-        X_val = X_train[-val_size:]
-        Y_val = Y_train[-val_size:]
-        X_train = X_train[:-val_size]
-        Y_train = Y_train[:-val_size]
-    
-    # 텐서가 GPU에 있다면 CPU로 이동시켜 DataLoader 생성에 사용
-    if x_is_cuda:
-        X_train_loader = X_train
-        X_val_loader = X_val
-    else:
-        X_train_loader = X_train.detach().cpu() if isinstance(X_train, torch.Tensor) else torch.FloatTensor(X_train)
-        X_val_loader = X_val.detach().cpu() if isinstance(X_val, torch.Tensor) else torch.FloatTensor(X_val)
-    
-    if y_is_cuda:
-        Y_train_loader = Y_train
-        Y_val_loader = Y_val
-    else:
-        Y_train_loader = Y_train.detach().cpu() if isinstance(Y_train, torch.Tensor) else torch.FloatTensor(Y_train)
-        Y_val_loader = Y_val.detach().cpu() if isinstance(Y_val, torch.Tensor) else torch.FloatTensor(Y_val)
-    
-    # 학습 데이터를 TensorDataset으로 변환
-    train_dataset = torch.utils.data.TensorDataset(X_train_loader, Y_train_loader)
-    val_dataset = torch.utils.data.TensorDataset(X_val_loader, Y_val_loader)
-    
-    # 워커 수 결정
-    if num_workers is None:
-        if device.type == 'cuda':
-            num_workers = min(2, os.cpu_count()) if os.cpu_count() > 2 else 0
-        else:
-            num_workers = min(4, os.cpu_count()) if os.cpu_count() > 4 else 0
-    
-    # DataLoader 설정 - pin_memory는 텐서가 CPU에 있고 디바이스가 CUDA일 때만 True
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, 
-        num_workers=num_workers, pin_memory=use_pin_memory,
-        prefetch_factor=2 if num_workers > 0 else None,
-        persistent_workers=True if num_workers > 0 else False
-    )
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=batch_size*2, shuffle=False,
-        num_workers=num_workers, pin_memory=use_pin_memory,
-        prefetch_factor=2 if num_workers > 0 else None,
-        persistent_workers=True if num_workers > 0 else False
-    )
-    
-    # 조기 종료를 위한 변수
-    best_val_loss = float('inf')
-    no_improve_epochs = 0
-    best_model_state = None
-    train_losses, val_losses = [], []
-    
-    # 학습 시작
+
+    # 훈련 루프
     for epoch in range(epochs):
         model.train()
-        train_loss = 0
+        running_loss = 0.0
         
-        # tqdm으로 진행률 표시
-        train_bar = tqdm(train_loader, desc=f'Epoch [{epoch+1}/{epochs}]') if verbose > 0 else train_loader
-        
-        # 에포크 시작 체크포인트 추가
-        performance_tracker.add_checkpoint(f"epoch_{epoch+1}_start")
-        
-        for inputs, targets in train_bar:
-            # 데이터를 해당 디바이스로 이동
-            inputs, targets = inputs.to(device), targets.to(device)
-            
+        for batch_idx, (inputs, targets) in enumerate(train_loader):
             optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
             
-            if scaler is not None:  # 혼합 정밀도 사용
-                with torch.amp.autocast('cuda'):  # 경고 해결
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                
-                # 스케일링된 역전파
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                loss.backward()
-                optimizer.step()
-            
-            train_loss += loss.item() * inputs.size(0)
-            
-            if verbose > 0:
-                train_bar.set_postfix({'Loss': f"{loss.item():.4f}"})
+            running_loss += loss.item()
         
-        # 에포크 종료 후 평균 손실 계산
-        train_loss = train_loss / len(train_loader.dataset)
-        train_losses.append(train_loss)
-        
-        # 검증
-        model.eval()
-        val_loss = 0
-        
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                val_loss += loss.item() * inputs.size(0)
-        
-        val_loss = val_loss / len(val_loader.dataset)
-        val_losses.append(val_loss)
-        
-        # 에포크 종료 체크포인트 추가
-        performance_tracker.add_checkpoint(f"epoch_{epoch+1}_end")
-        
-        # 진행 상황 출력
-        if verbose > 0 and (epoch+1) % (epochs//10 or 1) == 0:
-            print(f"Epoch [{epoch+1}/{epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-        
-        # 최고 모델 저장 및 조기 종료 확인
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_state = model.state_dict().copy()
-            no_improve_epochs = 0
-        else:
-            no_improve_epochs += 1
-            
-        # 조기 종료
-        if no_improve_epochs >= patience:
-            if verbose > 0:
-                print(f"조기 종료: {epoch+1} 에폭에서 검증 손실 개선 없음")
-            performance_tracker.log_operation("early_stopping")
-            break
-    
-    # 최고 모델 복원
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-    
-    # 훈련 완료 후 성능 통계 수집
-    performance_tracker.log_operation("completed_training")
-    performance_tracker.add_checkpoint("training_complete")
-    
-    return model, {'train_losses': train_losses, 'val_losses': val_losses}
+        print(f"Epoch [{epoch+1}/{epochs}], Loss: {running_loss / len(train_loader)}")
 
-def train_model_with_cv(model_creator, X, Y, cv=5, epochs=100, batch_size=32, **train_kwargs):
-    """
-    시계열 교차 검증을 사용하여 모델을 학습하고 평가
-    
-    Args:
-        model_creator: 모델 생성 함수
-        X: 전체 입력 데이터
-        Y: 전체 타겟 데이터
-        cv: 교차 검증 폴드 수
-        epochs: 각 폴드 학습의 에폭 수
-        
-    Returns:
-        최종 모델과 각 폴드의 검증 점수
-    """
-    tscv = TimeSeriesSplit(n_splits=cv)
-    val_scores = []
-    best_val_score = float('inf')
-    best_model = None
-    
-    for i, (train_idx, val_idx) in enumerate(tscv.split(X)):
-        X_train_fold, X_val_fold = X[train_idx], X[val_idx]
-        Y_train_fold, Y_val_fold = Y[train_idx], Y[val_idx]
-        
-        # 각 폴드마다 새로운 모델 생성
-        model = model_creator()
-        
-        model, _ = train_model(
-            model, 
-            X_train_fold, 
-            Y_train_fold, 
-            X_val=X_val_fold,
-            Y_val=Y_val_fold,
-            epochs=epochs, 
-            batch_size=batch_size, 
-            **train_kwargs
-        )
-        
-        # 검증 성능 평가
-        device = next(model.parameters()).device
-        X_val_fold = torch.tensor(X_val_fold if not isinstance(X_val_fold, torch.Tensor) else X_val_fold.numpy(), dtype=torch.float32).to(device)
-        Y_val_fold = torch.tensor(Y_val_fold if not isinstance(Y_val_fold, torch.Tensor) else Y_val_fold.numpy(), dtype=torch.float32).to(device)
-        
-        model.eval()
-        with torch.no_grad():
-            val_preds = model(X_val_fold)
-            val_score = nn.MSELoss()(val_preds, Y_val_fold).item()
-        
-        val_scores.append(val_score)
-        
-        # 최고 성능 모델 저장
-        if val_score < best_val_score:
-            best_val_score = val_score
-            best_model = model
-    
-    return best_model, val_scores
+    return model
 
-def train_ensemble_models(model_configs, X_train, Y_train, ensemble_size=5, cpu_models=None, 
-                          use_gpu=True, n_jobs=-1, num_workers=None, **train_kwargs):
+def train_ensemble_models(model_configs, X_train, Y_train, ensemble_size=3, epochs=50, batch_size=32, lr=0.001, use_gpu=True):
     """
-    앙상블을 위한 여러 모델을 병렬로 학습
+    여러 모델을 앙상블로 훈련하는 함수입니다.
     
-    Args:
-        model_configs: 각 모델 구성의 리스트 (모델 타입, 하이퍼파라미터 등)
-        X_train: 학습 입력 데이터
-        Y_train: 학습 타겟 데이터
-        ensemble_size: 각 모델 구성에서 학습할 모델 수
-        cpu_models: CPU에서 학습할 모델 타입 리스트 (예: ['transformer'])
-        use_gpu: GPU 사용 여부
-        n_jobs: 병렬 처리 작업 수 (CPU용)
-        num_workers: 데이터로더의 워커 수
-        
+    Parameters:
+        - model_configs: 모델 설정을 포함하는 딕셔너리 리스트
+        - X_train: 훈련 입력 데이터 (NumPy 배열)
+        - Y_train: 훈련 목표 데이터 (NumPy 배열)
+        - ensemble_size: 앙상블에 사용할 모델 수
+        - epochs: 훈련할 에포크 수
+        - batch_size: 배치 크기
+        - lr: 학습률
+        - use_gpu: GPU 사용 여부
     Returns:
-        학습된 모델들과 모델별 가중치
+        - 학습된 앙상블 모델 리스트
     """
-    if cpu_models is None:
-        cpu_models = ['transformer']  # 기본적으로 transformer는 CPU에서 훈련
-    
-    # GPU 사용 가능한지 확인
-    gpu_available = torch.cuda.is_available() and use_gpu
-    
-    # CPU와 GPU 모델 분리
-    gpu_model_configs = []
-    cpu_model_configs = []
+    ensemble_models = []
     
     for config in model_configs:
-        model_type = config["model_type"]
-        if model_type in cpu_models or not gpu_available:
-            cpu_model_configs.append(config)
-        else:
-            gpu_model_configs.append(config)
+        model_type = config.get('model_type', 'lstm')
+        input_dim = config.get('input_dim', X_train.shape[1])
+        hidden_dim = config.get('hidden_dim', 64)
+        output_dim = config.get('output_dim', Y_train.shape[1])
+        
+        model = create_model(model_type, input_dim, hidden_dim, output_dim, **config)
+        
+        # GPU 사용 여부에 따라 모델을 이동
+        if use_gpu and torch.cuda.is_available():
+            model = model.cuda()
+        
+        print(f"훈련 중: {model_type}")
+        
+        # 앙상블 모델 훈련
+        trained_model = train_model(model, X_train, Y_train, epochs=epochs, batch_size=batch_size, lr=lr)
+        
+        ensemble_models.append(trained_model)
     
-    all_models = []
-    start_time = time.time()
-    
-    # GPU 모델 학습
-    if gpu_model_configs and gpu_available:
-        print("Starting GPU model training...")
-        gpu_models = []
-        
-        for config in gpu_model_configs:
-            for i in range(ensemble_size):
-                config_name = f"{config['model_type']}_{i+1}"
-                print(f"Training {config_name} on GPU...")
-                
-                from model import create_model
-                model = create_model(**config)
-                
-                # 검증 데이터 분할
-                val_size = int(len(X_train) * 0.2)
-                X_train_sub, X_val = X_train[:-val_size], X_train[-val_size:]
-                Y_train_sub, Y_val = Y_train[:-val_size], Y_train[-val_size:]
-                
-                # num_workers 인자 전달 추가
-                trained_model, _ = train_model(
-                    model, 
-                    X_train_sub, 
-                    Y_train_sub, 
-                    X_val=X_val,
-                    Y_val=Y_val,
-                    num_workers=num_workers,
-                    **train_kwargs
-                )
-                
-                gpu_models.append(trained_model.cpu())  # CPU로 이동하여 메모리 확보
-        
-        all_models.extend(gpu_models)
-    
-    # CPU 모델 병렬 학습
-    if cpu_model_configs:
-        print("Starting CPU model training in parallel...")
-        
-        def train_one_model(config, model_idx):
-            config_name = f"{config['model_type']}_{model_idx+1}"
-            print(f"Training {config_name} on CPU...")
-            
-            from model import create_model
-            model = create_model(**config)
-            
-            # 검증 데이터 분할
-            val_size = int(len(X_train) * 0.2)
-            X_train_sub = X_train[:-val_size].numpy() if isinstance(X_train, torch.Tensor) else X_train[:-val_size]
-            Y_train_sub = Y_train[:-val_size].numpy() if isinstance(Y_train, torch.Tensor) else Y_train[:-val_size]
-            X_val = X_train[-val_size:].numpy() if isinstance(X_train, torch.Tensor) else X_train[-val_size:]
-            Y_val = Y_train[-val_size:].numpy() if isinstance(Y_train, torch.Tensor) else Y_train[-val_size:]
-            
-            # num_workers 인자 전달 추가
-            trained_model, _ = train_model(
-                model, 
-                X_train_sub, 
-                Y_train_sub, 
-                X_val=X_val,
-                Y_val=Y_val,
-                num_workers=num_workers,
-                **train_kwargs
-            )
-            
-            return trained_model
-        
-        cpu_jobs = []
-        for config in cpu_model_configs:
-            for i in range(ensemble_size):
-                cpu_jobs.append((config, i))
-        
-        n_jobs = n_jobs if n_jobs != -1 else os.cpu_count()
-        n_jobs = min(n_jobs, len(cpu_jobs))
-        
-        cpu_models = Parallel(n_jobs=n_jobs)(
-            delayed(train_one_model)(config, idx) for config, idx in cpu_jobs
-        )
-        
-        all_models.extend(cpu_models)
-    
-    print(f"All models trained in {time.time() - start_time:.2f} seconds")
-    
-    # 모델별 가중치 계산 (여기서는 동일 가중치 사용)
-    weights = np.ones(len(all_models)) / len(all_models)
-    
-    return all_models, weights
+    return ensemble_models

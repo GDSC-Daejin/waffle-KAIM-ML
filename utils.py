@@ -23,7 +23,12 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 def generate_cache_key(func_name, args, kwargs):
     """
     함수 이름, 인자, 키워드 인자를 기반으로 캐시 키를 생성합니다.
+    force_refresh 인자는 제외합니다.
     """
+    # force_refresh 인자는 캐시 키 생성에서 제외
+    if 'force_refresh' in kwargs:
+        kwargs = {k: v for k, v in kwargs.items() if k != 'force_refresh'}
+        
     # 인자들을 문자열로 변환
     args_str = str([str(arg) for arg in args])
     kwargs_str = str([(k, str(v)) for k, v in kwargs.items()])
@@ -42,12 +47,15 @@ def cache_result(expire_hours=24):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
+            # force_refresh가 True면 캐시 무시
+            force_refresh = kwargs.pop('force_refresh', False)
+            
             # 캐시 키 생성
             cache_key = generate_cache_key(func.__name__, args, kwargs)
             cache_file = os.path.join(CACHE_DIR, f"{cache_key}.pkl")
             
-            # 캐시 파일 존재 및 만료 여부 확인
-            if os.path.exists(cache_file):
+            # 캐시 강제 갱신 또는 파일 존재 및 만료 여부 확인
+            if not force_refresh and os.path.exists(cache_file):
                 # 파일 수정 시간 확인
                 mod_time = os.path.getmtime(cache_file)
                 current_time = time.time()
@@ -58,10 +66,16 @@ def cache_result(expire_hours=24):
                         print(f"Cache hit: {func.__name__}")
                         return pickle.load(f)
             
-            # 캐시가 없거나 만료된 경우 함수 실행
+            # 캐시가 없거나 만료되었거나 강제 갱신이면 함수 실행
+            if force_refresh:
+                print(f"강제 갱신: {func.__name__} 실행")
+            else:
+                print(f"캐시 없음/만료됨: {func.__name__} 실행")
+                
+            # 원래 함수에 force_refresh를 다시 추가하지 않고 실행
             result = func(*args, **kwargs)
             
-            # 결과 캐싱
+            # 결과 캐싱 (강제 갱신이어도 캐시 저장)
             with open(cache_file, 'wb') as f:
                 pickle.dump(result, f)
             

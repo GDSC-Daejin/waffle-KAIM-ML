@@ -91,137 +91,40 @@ def analyze_feature_importance(model, X, feature_names, target_names, n_samples=
     반환:
       - 특성 중요도 데이터프레임
     """
-    # 중요: 학습 모드로 설정하여 cudnn RNN backward 오류 방지
-    model.train()
-    
-    # 모델 디바이스 확인
-    device = next(model.parameters()).device
+    model.eval()
     
     # 배경 데이터 (샘플링)
     background_indices = np.random.choice(len(X), min(n_samples, len(X)), replace=False)
     background = X[background_indices]
     
-    # PyTorch 모델을 래핑하는 함수 - 디바이스 일치 보장
+    # PyTorch 모델을 래핑하는 함수
     def model_predict(x):
-        with torch.no_grad():  # eval() 대신 no_grad() 사용
-            # 입력 데이터를 모델과 같은 디바이스로 이동
-            x_tensor = torch.FloatTensor(x).to(device)
-            return model(x_tensor).cpu().numpy()
+        with torch.no_grad():
+            x_tensor = torch.FloatTensor(x)
+            return model(x_tensor).numpy()
     
-    # SHAP 값 계산을 위해 GradientExplainer 사용 (DeepExplainer 대신)
-    # GradientExplainer는 backward() 호출 방식이 달라 cudnn RNN 오류를 피할 수 있음
-    background_tensor = torch.FloatTensor(background).to(device)
-    
-    try:
-        # 먼저 GradientExplainer 시도 (DeepExplainer보다 더 안정적)
-        explainer = shap.GradientExplainer(model, background_tensor)
-    except Exception as e:
-        print(f"GradientExplainer 초기화 중 오류 발생: {e}")
-        try:
-            # 두 번째로 Kernel Explainer 시도 (모델에 구애받지 않음)
-            model.eval()  # Kernel Explainer는 eval 모드가 더 적합
-            explainer = shap.KernelExplainer(model_predict, background)
-        except Exception as e2:
-            print(f"KernelExplainer 초기화 중 오류 발생: {e2}")
-            # 특성 중요도를 무작위 값으로 채움
-            feature_importance = np.random.rand(len(feature_names), len(target_names))
-            print("SHAP 초기화 실패, 무작위 특성 중요도 반환")
-            importance_df = pd.DataFrame(feature_importance, index=feature_names, columns=target_names)
-            return importance_df
+    # SHAP 설명자 생성
+    explainer = shap.DeepExplainer(model, torch.FloatTensor(background))
     
     # 모든 데이터에 대한 SHAP 값 계산
     sample_indices = np.random.choice(len(X), min(n_samples, len(X)), replace=False)
     sample_data = X[sample_indices]
-    
-    # 샘플 데이터를 모델과 같은 디바이스로 이동
-    try:
-        sample_tensor = torch.FloatTensor(sample_data).to(device)
-        
-        # 오류 방지를 위한 try-except 블록
-        try:
-            if isinstance(explainer, shap.GradientExplainer):
-                shap_values = explainer.shap_values(sample_tensor)
-            else:
-                model.eval()  # KernelExplainer는 eval 모드 필요
-                shap_values = explainer.shap_values(sample_data)
-        except RuntimeError as e:
-            print(f"SHAP 값 계산 중 런타임 오류: {e}")
-            # 폴백: 단순한 특성 중요도 계산 방법 사용
-            feature_importance = calculate_simple_feature_importance(model, sample_tensor, target_names)
-            importance_df = pd.DataFrame(feature_importance, index=feature_names, columns=target_names)
-            return importance_df
-    except Exception as e:
-        print(f"샘플 텐서 생성 중 오류: {e}")
-        feature_importance = calculate_simple_feature_importance(model, torch.FloatTensor(sample_data).to(device), target_names)
-        importance_df = pd.DataFrame(feature_importance, index=feature_names, columns=target_names)
-        return importance_df
+    shap_values = explainer.shap_values(torch.FloatTensor(sample_data))
     
     # 시계열 데이터 중 마지막 시점만 사용
     feature_importance = np.zeros((len(feature_names), len(target_names)))
     
-    # shap_values 형태에 따라 처리 방식 다르게 적용
-    if isinstance(shap_values, list):
-        # 리스트 형태 (각 타겟별 분리)
-        for target_idx in range(len(target_names)):
-            target_shap = shap_values[target_idx]
-            
-            # shap_values 형태 처리
-            if len(target_shap.shape) == 3:  # (samples, sequence, features)
-                for feature_idx in range(len(feature_names)):
-                    feature_importance[feature_idx, target_idx] = np.abs(target_shap[:, :, feature_idx]).mean()
-            elif len(target_shap.shape) == 2:  # (samples, features)
-                for feature_idx in range(len(feature_names)):
-                    feature_importance[feature_idx, target_idx] = np.abs(target_shap[:, feature_idx]).mean()
-    else:
-        # 단일 배열 형태
-        for target_idx in range(len(target_names)):
-            for feature_idx in range(len(feature_names)):
-                if len(shap_values.shape) == 3:
-                    feature_importance[feature_idx, target_idx] = np.abs(shap_values[:, feature_idx, target_idx]).mean()
-                else:
-                    # 형태를 알 수 없는 경우 기본값 사용
-                    feature_importance[feature_idx, target_idx] = 1.0 / len(feature_names)
+    for target_idx in range(len(target_names)):
+        target_shap = shap_values[target_idx]
+        
+        # 각 특성별로 중요도 계산 (절대값의 평균)
+        for feature_idx in range(len(feature_names)):
+            # 시계열의 모든 시점에 대해 평균
+            feature_importance[feature_idx, target_idx] = np.abs(target_shap[:, :, feature_idx]).mean()
     
     # 결과를 데이터프레임으로 변환
     importance_df = pd.DataFrame(feature_importance, index=feature_names, columns=target_names)
     return importance_df
-
-def calculate_simple_feature_importance(model, X_tensor, target_names):
-    """
-    SHAP 없이 간단한 특성 중요도 계산 (폴백 메서드)
-    입력의 작은 변화가 출력에 미치는 영향을 측정
-    """
-    device = next(model.parameters()).device
-    n_features = X_tensor.shape[2]
-    n_targets = len(target_names)
-    importance = np.zeros((n_features, n_targets))
-    
-    # 원본 출력 계산
-    model.eval()
-    with torch.no_grad():
-        original_output = model(X_tensor).cpu().numpy().mean(axis=0)
-    
-    # 각 특성별로 작은 변화를 주고 출력 변화 측정
-    for feat_idx in range(n_features):
-        # 특성값 변경
-        X_modified = X_tensor.clone()
-        X_modified[:, :, feat_idx] *= 1.05  # 5% 증가
-        
-        # 변경된 입력으로 출력 계산
-        with torch.no_grad():
-            modified_output = model(X_modified).cpu().numpy().mean(axis=0)
-        
-        # 변화량 계산
-        for target_idx in range(n_targets):
-            importance[feat_idx, target_idx] = abs(modified_output[target_idx] - original_output[target_idx])
-    
-    # 특성 중요도 정규화
-    for target_idx in range(n_targets):
-        total = importance[:, target_idx].sum()
-        if total > 0:
-            importance[:, target_idx] /= total
-    
-    return importance
 
 def plot_feature_importance(importance_df, top_n=15, figsize=(12, 10)):
     """

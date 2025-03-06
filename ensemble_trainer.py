@@ -109,8 +109,8 @@ class OilPriceEnsembleTrainer:
         fh = logging.FileHandler(f"{log_dir}/training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
         fh.setLevel(logging.INFO)
         
-        # 포맷 설정
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levellevel)s - %(message)s')
+        # 포맷 설정 - 'levellevel' 오타를 'levelname'으로 수정
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         ch.setFormatter(formatter)
         fh.setFormatter(formatter)
         
@@ -545,7 +545,8 @@ class OilPriceEnsembleTrainer:
 
 
 def run_ensemble_prediction_pipeline(features_df, target_cols, look_back=3, future_steps=7, 
-                                     ensemble_size=3, use_gpu=True, batch_size=None, num_workers=None):
+                                     ensemble_size=3, use_gpu=True, batch_size=None, 
+                                     num_workers=None, force_refresh=False):
     """
     앙상블 예측 파이프라인 실행
     
@@ -558,10 +559,24 @@ def run_ensemble_prediction_pipeline(features_df, target_cols, look_back=3, futu
         use_gpu: GPU 사용 여부
         batch_size: 학습 배치 크기 (None이면 자동 설정)
         num_workers: 데이터 로딩 작업자 수 (None이면 자동 설정)
+        force_refresh: 캐시된 모델을 무시하고 새로 학습 여부
     
     Returns:
         지역별 예측 결과
     """
+    # 로거 설정
+    logger = logging.getLogger("EnsemblePipeline")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    
+    # 강제 갱신 옵션 알림
+    if force_refresh:
+        logger.info("강제 모델 재학습 모드: 기존 저장된 모델 무시")
+    
     # 최적의 병렬 처리 설정 적용
     if num_workers is None:
         num_workers = min(16, os.cpu_count())  # 128GB RAM 활용을 위한 worker 수 증가
@@ -575,18 +590,39 @@ def run_ensemble_prediction_pipeline(features_df, target_cols, look_back=3, futu
         use_gpu=use_gpu
     )
     
-    # 저장된 모델이 있는지 확인하고 로드
-    if not trainer.load_models():
+    # 저장된 모델이 있는지 확인하고 로드 (force_refresh가 True면 무시)
+    if not force_refresh and trainer.load_models():
+        logger.info("저장된 모델을 성공적으로 로드했습니다.")
+    else:
+        if force_refresh:
+            logger.info("강제 갱신 모드: 모델을 새로 학습합니다.")
+        else:
+            logger.info("저장된 모델을 찾을 수 없거나 로드하는데 실패했습니다. 새로 학습합니다.")
+        
         # 변수 중요도 분석
+        logger.info("특성 중요도 분석 시작...")
         importance_df = trainer.analyze_variable_importance()
+        logger.info("특성 중요도 분석 완료")
+        
+        # 지역별 모델 학습 시작 시간 기록
+        start_time = time.time()
+        logger.info("지역별 모델 학습 시작...")
         
         # 지역별 모델 학습 - batch_size 매개변수 전달
         trainer.train_region_models(epochs=100, batch_size=batch_size, patience=10)
         
+        # 학습 완료 시간 및 소요 시간 출력
+        end_time = time.time()
+        logger.info(f"모든 모델 학습 완료. 총 소요 시간: {end_time - start_time:.2f}초")
+        
         # 학습된 모델 저장
+        logger.info("학습된 모델 저장 중...")
         trainer.save_models()
+        logger.info("모델 저장 완료")
     
     # 미래 예측 수행
+    logger.info(f"향후 {future_steps}일에 대한 예측 시작...")
     predictions = trainer.predict_future(future_steps=future_steps)
+    logger.info("예측 완료")
     
     return predictions
