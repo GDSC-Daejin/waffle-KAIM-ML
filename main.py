@@ -14,6 +14,17 @@ from data_preprocessor import preprocess_data
 from logging_utils import CustomProgressBar, PrettyLogger
 from parallel_utils import accelerate_training
 from utils import optimize_memory_usage
+from dotenv import load_dotenv  # dotenv 추가
+
+# .env 파일 로드
+load_dotenv()
+
+# 환경 변수에서 설정 읽기
+EPOCHS = int(os.getenv("EPOCHS", "100"))
+IMPORTANCE_EPOCHS = int(os.getenv("IMPORTANCE_EPOCHS", "50"))
+ENSEMBLE_SIZE = int(os.getenv("ENSEMBLE_SIZE", "3"))
+LOOK_BACK = int(os.getenv("LOOK_BACK", "3"))
+FUTURE_STEPS = int(os.getenv("FUTURE_STEPS", "7"))
 
 def setup_logging():
     """로깅 환경 설정"""
@@ -56,7 +67,7 @@ def setup_logging():
     
     return logger
 
-def run_prediction_pipeline(df, target_cols, look_back=3, future_steps=7, ensemble_size=3, use_gpu=True, batch_size=None):
+def run_prediction_pipeline(df, target_cols, look_back=None, future_steps=None, ensemble_size=None, use_gpu=True, batch_size=None):
     """
     유가 예측 파이프라인을 실행합니다.
     
@@ -72,6 +83,14 @@ def run_prediction_pipeline(df, target_cols, look_back=3, future_steps=7, ensemb
     Returns:
         지역별 예측 결과
     """
+    # 환경 변수 기본 값 사용
+    if look_back is None:
+        look_back = LOOK_BACK
+    if future_steps is None:
+        future_steps = FUTURE_STEPS
+    if ensemble_size is None:
+        ensemble_size = ENSEMBLE_SIZE
+
     logger = logging.getLogger(__name__)
     logger.info("\n" + "="*50)
     logger.info("예측 파이프라인 시작")

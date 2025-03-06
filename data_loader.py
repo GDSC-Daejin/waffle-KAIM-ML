@@ -48,7 +48,7 @@ def load_data_from_mongo():
     
     # 최근 데이터를 가져오기 위한 날짜 범위 생성
     end_date = datetime.datetime.now()
-    days_to_look_back = int(os.getenv("DAYS_TO_LOOK_BACK", "2200"))
+    days_to_look_back = int(os.getenv("DAYS_TO_LOOK_BACK", "2205"))
     start_date = end_date - datetime.timedelta(days=days_to_look_back)
     
     date_list = []

@@ -17,6 +17,17 @@ from tqdm import tqdm
 import pickle
 import matplotlib.pyplot as plt
 import sys
+from dotenv import load_dotenv  # dotenv 추가
+
+# .env 파일 로드
+load_dotenv()
+
+# 환경 변수 값 읽기
+EPOCHS = int(os.getenv("EPOCHS", "100"))
+IMPORTANCE_EPOCHS = int(os.getenv("IMPORTANCE_EPOCHS", "50"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))
+PATIENCE = int(os.getenv("PATIENCE", "10"))
+ENSEMBLE_SIZE = int(os.getenv("ENSEMBLE_SIZE", "3"))
 
 class OilPriceEnsembleTrainer:
     """유가 예측을 위한 앙상블 모델 트레이너"""
@@ -155,7 +166,7 @@ class OilPriceEnsembleTrainer:
             self.logger.info(f"발견된 지역: {self.regions}")
             self.is_region_data = True
             
-            # area 컬럼을 제거
+            # area 컬럼을 제거ㄴㄴ
             features = features.drop(['area'], axis=1)
         else:
             self.regions = ['National']
@@ -212,8 +223,10 @@ class OilPriceEnsembleTrainer:
             X_train_device = self.X_train.to(self.device)
             Y_train_device = self.Y_train.to(self.device)
             
-            # 모델 학습
-            model, _ = train_model(model, X_train_device, Y_train_device, epochs=50, batch_size=32, verbose=1)
+            # .env에서 설정한 에포크 수 사용
+            self.logger.info(f"변수 중요도 분석을 위해 {IMPORTANCE_EPOCHS}번의 에포크로 모델 학습")
+            model, _ = train_model(model, X_train_device, Y_train_device, 
+                              epochs=IMPORTANCE_EPOCHS, batch_size=BATCH_SIZE, verbose=10)
             
             # 중요: 분석 전에 CPU로 모델 이동
             model = model.cpu()
@@ -249,9 +262,11 @@ class OilPriceEnsembleTrainer:
                 columns=self.target_names
             )
 
-    def train_region_models(self, epochs=100, batch_size=None, patience=10):
+    def train_region_models(self, epochs=None, batch_size=None, patience=None):
         """지역별 모델 학습"""
-        # GPU 최적화를 위한 배치 크기 자동 계산
+        # 기본값이 None인 경우 .env 설정 사용
+        if epochs is None:
+            epochs = EPOCHS
         if batch_size is None:
             if self.use_gpu and torch.cuda.is_available():
                 batch_size = optimize_gpu_tensor_ops(mixed_precision=self.use_mixed_precision)
@@ -259,8 +274,10 @@ class OilPriceEnsembleTrainer:
                 # 128GB RAM 활용을 위한 CPU 배치 크기
                 total_ram = psutil.virtual_memory().total / (1024**3)  # GB
                 batch_size = min(2048, int(total_ram / 16))  # RAM 크기에 맞춤
+        if patience is None:
+            patience = PATIENCE
         
-        self.logger.info(f"학습에 사용할 배치 크기: {batch_size}")
+        self.logger.info(f"학습 설정: 에포크 {epochs}, 배치 크기 {batch_size}, 인내심 {patience}")
         
         # 단일 데이터셋 처리
         if not self.is_region_data:
@@ -352,6 +369,12 @@ class OilPriceEnsembleTrainer:
         X_train_data, X_val = X_train[:train_size], X_train[train_size:]
         Y_train_data, Y_val = Y_train[:train_size], Y_train[train_size:]
         
+        # 안전한 배치 크기 설정 (GPU 메모리 과부하 방지)
+        if self.use_gpu and torch.cuda.is_available():
+            # GTX 1080 8GB에 더 안전한 배치 사이즈
+            batch_size = min(batch_size, 12)
+            self.logger.info(f"GPU 메모리 안전을 위해 배치 크기를 {batch_size}로 조정했습니다.")
+        
         # 다양한 모델 훈련
         for i, config in enumerate(model_configs[:self.ensemble_size]):
             model_type = config.get('model_type', 'lstm')
@@ -359,11 +382,15 @@ class OilPriceEnsembleTrainer:
             self.logger.info(f"모델 {i+1}/{len(model_configs[:self.ensemble_size])} ({model_type}) 훈련 중...")
             
             try:
+                # 훈련 시작 전 GPU 메모리 정리
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
                 # 모델 생성 및 디바이스 이동
                 model = create_model(**config)
                 model = model.to(self.device)
                 
-                # 텐서 변환 (이미 텐서인 경우 변환하지 않음)
+                # 텐서 변환 및 디바이스 이동
                 if isinstance(X_train_data, torch.Tensor):
                     X_train_tensor = X_train_data.to(self.device)
                 else:
@@ -374,19 +401,16 @@ class OilPriceEnsembleTrainer:
                 else:
                     Y_train_tensor = torch.FloatTensor(Y_train_data).to(self.device)
                 
-                # 검증 데이터도 동일한 디바이스로 이동 (중요!)
+                # 검증 데이터도 준비 (하지만 아직 디바이스로 이동하지 않음)
                 if isinstance(X_val, torch.Tensor):
-                    X_val_tensor = X_val.to(self.device)
+                    X_val_cpu = X_val.cpu()  # 일단 CPU에 보관
                 else:
-                    X_val_tensor = torch.FloatTensor(X_val).to(self.device)
+                    X_val_cpu = torch.FloatTensor(X_val)
                     
                 if isinstance(Y_val, torch.Tensor):
-                    Y_val_tensor = Y_val.to(self.device)
+                    Y_val_cpu = Y_val.cpu()  # 일단 CPU에 보관
                 else:
-                    Y_val_tensor = torch.FloatTensor(Y_val).to(self.device)
-                
-                # 모델 학습 시 진행 표시줄 설정
-                verbose_value = 5  # 5에포크마다 출력
+                    X_val_cpu = torch.FloatTensor(Y_val)
                 
                 # 모델 학습 (수정된 train_model은 내부에서 디바이스 처리)
                 model, history = train_model(
@@ -395,26 +419,48 @@ class OilPriceEnsembleTrainer:
                     Y_train_tensor, 
                     epochs=epochs, 
                     batch_size=batch_size, 
-                    verbose=verbose_value
+                    verbose=5
                 )
                 
-                # 검증 손실 계산 - 모델과 데이터가 같은 디바이스에 있어야 함
+                # 검증 손실 계산 - 메모리 관리를 위해 작은 배치로 처리
                 model.eval()
+                val_loss = 0.0
+                val_batch_size = 32  # 검증은 더 작은 배치로
+                n_batches = 0
+                
                 with torch.no_grad():
-                    # 여기서 X_val_tensor와 Y_val_tensor는 이미 올바른 디바이스에 있음
-                    val_pred = model(X_val_tensor)
-                    val_loss = torch.nn.MSELoss()(val_pred, Y_val_tensor).item()
-                    val_losses.append(val_loss)
+                    for start_idx in range(0, len(X_val_cpu), val_batch_size):
+                        end_idx = min(start_idx + val_batch_size, len(X_val_cpu))
+                        
+                        # 현재 배치만 GPU로 이동
+                        X_batch = X_val_cpu[start_idx:end_idx].to(self.device)
+                        Y_batch = Y_val_cpu[start_idx:end_idx].to(self.device)
+                        
+                        # 예측 및 손실 계산
+                        outputs = model(X_batch)
+                        batch_loss = torch.nn.MSELoss()(outputs, Y_batch).item()
+                        
+                        # 누적
+                        val_loss += batch_loss
+                        n_batches += 1
+                        
+                        # 배치 데이터 메모리 해제
+                        del X_batch, Y_batch
+                        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                
+                # 평균 손실 계산
+                val_loss = val_loss / max(1, n_batches)
+                val_losses.append(val_loss)
                 
                 # 검증 손실 기반 가중치 계산
                 weight = 1.0 / (val_loss + 1e-10)  # 0으로 나누기 방지
-                
-                # 디바이스 사이에서 이동할 때 복사본 생성
                 weights.append(weight)
                 
-                # CPU로 이동하여 메모리 절약 (검증 후에 이동)
+                # CPU로 이동하여 메모리 절약
                 model = model.cpu()
                 models.append(model)
+                
+                self.logger.info(f"모델 {i+1} 학습 완료: 최종 검증 손실 {val_loss:.6f}")
                 
             except Exception as e:
                 self.logger.error(f"모델 {model_type} 학습 중 오류 발생: {str(e)}")
@@ -422,9 +468,10 @@ class OilPriceEnsembleTrainer:
                 self.logger.error(traceback.format_exc())
                 # 오류 발생 시 다음 모델로 계속 진행
                 continue
-                
-            # 메모리 정리
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            finally:
+                # 메모리 정리 (finally 블록에서 항상 실행)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         # 학습된 모델이 없으면 오류 발생
         if not models:
@@ -432,9 +479,10 @@ class OilPriceEnsembleTrainer:
         
         # 가중치 계산 방식 개선
         if models:
-            # 지수 가중치 적용 (최근 모델에 더 높은 가중치)
+            # 지수 가중치 적용
             weights = np.array(weights)
             weights = weights / weights.sum()  # 정규화
+            self.logger.info(f"모델 가중치: {weights.round(3)}")
             
             # 앙상블 모델 생성
             ensemble = EnsembleModel(models, weights)
@@ -683,7 +731,7 @@ class OilPriceEnsembleTrainer:
 
 
 def run_ensemble_prediction_pipeline(features_df, target_cols, look_back=3, future_steps=7, 
-                                    ensemble_size=3, use_gpu=True, batch_size=None):
+                                    ensemble_size=None, use_gpu=True, batch_size=None):
     """
     앙상블 예측 파이프라인 실행
     
@@ -760,7 +808,7 @@ def run_ensemble_prediction_pipeline(features_df, target_cols, look_back=3, futu
         logger.info("지역별 모델 학습 시작...")
         
         # 지역별 모델 학습
-        trainer.train_region_models(epochs=100, batch_size=batch_size, patience=10)
+        trainer.train_region_models(epochs=EPOCHS, batch_size=batch_size, patience=PATIENCE)
         
         # 학습 완료 시간 및 소요 시간 출력
         model_end_time = time.time()

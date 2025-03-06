@@ -7,8 +7,7 @@ from model import create_model
 
 def train_model(model, X_train, Y_train, epochs=50, batch_size=32, lr=0.001, verbose=0):
     """모델을 훈련하는 함수"""
-    
-    # 디바이스 확인 - 모델과 데이터가 같은 디바이스에 있어야 함
+    # 디바이스 확인
     device = next(model.parameters()).device
     
     # X_train, Y_train을 모델과 같은 디바이스로 이동
@@ -19,58 +18,83 @@ def train_model(model, X_train, Y_train, epochs=50, batch_size=32, lr=0.001, ver
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = torch.nn.MSELoss()
     
-    # 훈련 히스토리 저장
+    # 히스토리 저장
     history = {'loss': []}
     
-    # 모델을 훈련 모드로 설정
-    model.train()
+    # 조기 종료 설정
+    patience = 10
+    best_loss = float('inf')
+    patience_counter = 0
     
-    # 학습 배치 설정 (배치 크기가 데이터셋보다 크면 조정)
+    # 학습 배치 설정
     batch_size = min(batch_size, len(X_train))
     
     # 에포크별 학습
     for epoch in range(epochs):
-        # 배치 인덱스 생성 (무작위)
-        indices = torch.randperm(X_train.size(0))
-        
-        # 배치 단위로 훈련
-        total_loss = 0
+        # 그라디언트 초기화
+        model.train()
+        running_loss = 0.0
         num_batches = 0
         
+        # 무작위 인덱스
+        indices = torch.randperm(X_train.size(0))
+        
         for start_idx in range(0, X_train.size(0), batch_size):
-            # 배치 인덱스
-            batch_indices = indices[start_idx:start_idx + batch_size]
-            
-            # 배치 데이터
-            X_batch = X_train[batch_indices]
-            Y_batch = Y_train[batch_indices]
-            
-            # 그래디언트 초기화
-            optimizer.zero_grad()
-            
-            # 순전파
-            outputs = model(X_batch)
-            
-            # 손실 계산
-            loss = criterion(outputs, Y_batch)
-            
-            # 역전파
-            loss.backward()
-            
-            # 파라미터 업데이트
-            optimizer.step()
-            
-            # 손실 누적
-            total_loss += loss.item()
-            num_batches += 1
+            try:
+                # 배치 인덱스
+                batch_indices = indices[start_idx:start_idx + batch_size]
+                
+                # 배치 데이터
+                X_batch = X_train[batch_indices]
+                Y_batch = Y_train[batch_indices]
+                
+                # 그래디언트 초기화
+                optimizer.zero_grad()
+                
+                # 순전파
+                outputs = model(X_batch)
+                
+                # 손실 계산
+                loss = criterion(outputs, Y_batch)
+                
+                # 역전파
+                loss.backward()
+                
+                # 그라디언트 클리핑 (폭주 방지)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # 파라미터 업데이트
+                optimizer.step()
+                
+                # 손실 누적
+                running_loss += loss.item()
+                num_batches += 1
+                
+            except Exception as e:
+                print(f"배치 처리 중 오류 발생: {e}, 이 배치는 건너뜁니다.")
+                continue
         
-        # 에포크 평균 손실 계산
-        avg_loss = total_loss / num_batches
-        history['loss'].append(avg_loss)
+        # 에포크 평균 손실
+        epoch_loss = running_loss / max(1, num_batches)
+        history['loss'].append(epoch_loss)
         
-        # 학습 과정 출력
+        # 진행 상황 출력
         if verbose > 0 and (epoch + 1) % verbose == 0:
-            print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {epoch_loss:.6f}")
+        
+        # 조기 종료 검사
+        if epoch_loss < best_loss:
+            best_loss = epoch_loss
+            patience_counter = 0
+            # 최적 모델 저장
+            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"조기 종료! {patience}번의 에포크 동안 개선되지 않았습니다.")
+                # 최적 상태로 복원
+                model.load_state_dict(best_model_state)
+                break
     
     return model, history
 

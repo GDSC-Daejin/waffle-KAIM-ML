@@ -31,3 +31,7 @@ cache
 __pycache__
 logs
 model_cache
+results
+prediction_images
+cache
+logs
